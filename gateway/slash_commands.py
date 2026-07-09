@@ -2727,11 +2727,14 @@ class GatewaySlashCommandsMixin:
             self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
-        if effort == "none":
-            parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
-            parsed = {"enabled": True, "effort": effort}
-        else:
+
+        # Keep gateway command validation in sync with config/CLI parsing.
+        # This includes provider-specific levels such as ``max`` and avoids a
+        # stale local allowlist rejecting values the Hermes core accepts.
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(effort)
+        if parsed is None:
             return t(
                 "gateway.reasoning.unknown_arg",
                 arg=effort or raw_args.lower(),

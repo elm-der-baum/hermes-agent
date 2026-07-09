@@ -182,7 +182,7 @@ gateway:
     level_disabled:            "none (вимкнено)"
     scope_session:             "перевизначення сеансу"
     scope_global:              "глобальна конфігурація"
-    status:                    "🧠 **Налаштування мислення**\n\n**Зусилля:** `{level}`\n**Область:** {scope}\n**Показ:** {display}\n\n_Використання:_ `/reasoning <none|minimal|low|medium|high|xhigh|reset|show|hide> [--global]`"
+    status:                    "🧠 **Налаштування мислення**\n\n**Зусилля:** `{level}`\n**Область:** {scope}\n**Показ:** {display}\n\n_Використання:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
     display_on:                "увімкнено ✓"
     display_off:               "вимкнено"
     display_set_on:            "🧠 ✓ Показ мислення: **УВІМКНЕНО**\nДумки моделі будуть показуватися перед кожною відповіддю на **{platform}**."

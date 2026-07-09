@@ -182,7 +182,7 @@ gateway:
     level_disabled:            "none (gedeaktiveer)"
     scope_session:             "sessie-oorskryf"
     scope_global:              "globale konfigurasie"
-    status:                    "🧠 **Redenering-instellings**\n\n**Inspanning:** `{level}`\n**Bereik:** {scope}\n**Vertoon:** {display}\n\n_Gebruik:_ `/reasoning <none|minimal|low|medium|high|xhigh|reset|show|hide> [--global]`"
+    status:                    "🧠 **Redenering-instellings**\n\n**Inspanning:** `{level}`\n**Bereik:** {scope}\n**Vertoon:** {display}\n\n_Gebruik:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
     display_on:                "aan ✓"
     display_off:               "af"
     display_set_on:            "🧠 ✓ Redenering-vertoon: **AAN**\nDie model se denke sal voor elke antwoord op **{platform}** vertoon word."

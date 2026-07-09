@@ -182,7 +182,7 @@ gateway:
     level_disabled:            "none (desativado)"
     scope_session:             "substituição de sessão"
     scope_global:              "configuração global"
-    status:                    "🧠 **Definições de raciocínio**\n\n**Esforço:** `{level}`\n**Âmbito:** {scope}\n**Visualização:** {display}\n\n_Uso:_ `/reasoning <none|minimal|low|medium|high|xhigh|reset|show|hide> [--global]`"
+    status:                    "🧠 **Definições de raciocínio**\n\n**Esforço:** `{level}`\n**Âmbito:** {scope}\n**Visualização:** {display}\n\n_Uso:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
     display_on:                "ativada ✓"
     display_off:               "desativada"
     display_set_on:            "🧠 ✓ Visualização do raciocínio: **ATIVADA**\nO pensamento do modelo será mostrado antes de cada resposta em **{platform}**."
