@@ -373,6 +373,13 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+ULTRA_REASONING_GUIDANCE = (
+    "# Ultra reasoning mode\n"
+    "Use maximum reasoning and proactively delegate independent, complex "
+    "workstreams to subagents when that improves quality or speed. Keep simple "
+    "tasks local, verify subagent results, and integrate them into one final answer."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

@@ -182,7 +182,7 @@ gateway:
     level_disabled:            "none (kikapcsolva)"
     scope_session:             "munkamenet-felülbírálás"
     scope_global:              "globális konfiguráció"
-    status:                    "🧠 **Gondolkodási beállítások**\n\n**Erőfeszítés:** `{level}`\n**Hatókör:** {scope}\n**Megjelenítés:** {display}\n\n_Használat:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
+    status:                    "🧠 **Gondolkodási beállítások**\n\n**Erőfeszítés:** `{level}`\n**Hatókör:** {scope}\n**Megjelenítés:** {display}\n\n_Használat:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"
     display_on:                "be ✓"
     display_off:               "ki"
     display_set_on:            "🧠 ✓ Gondolkodás megjelenítése: **BE**\nA modell gondolatai minden válasz előtt megjelennek itt: **{platform}**."

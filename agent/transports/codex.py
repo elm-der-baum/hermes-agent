@@ -163,6 +163,11 @@ class ResponsesApiTransport(ProviderTransport):
                 reasoning_effort = reasoning_config["effort"]
 
         _effort_clamp = {"minimal": "low"}
+        # Codex Ultra is a client-side mode: the official Codex client enables
+        # proactive multi-agent delegation, then sends Max to the model API.
+        # Sending raw ``ultra`` to /backend-api/codex is rejected with HTTP 400.
+        if is_codex_backend and reasoning_effort == "ultra":
+            reasoning_effort = "max"
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)

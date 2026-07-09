@@ -86,12 +86,29 @@ class TestReasoningCommand:
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", True)
 
     @pytest.mark.asyncio
-    async def test_reasoning_status_lists_max(self):
+    async def test_reasoning_status_lists_max_and_ultra(self):
         runner = _make_runner()
 
         result = await runner._handle_reasoning_command(_make_event("/reasoning"))
 
         assert "|max|" in result
+        assert "|ultra|" in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("level", ["ultra", "u"])
+    async def test_reasoning_command_accepts_ultra_and_u_alias(self, level):
+        runner = _make_runner()
+        event = _make_event(f"/reasoning {level}")
+        session_key = runner._session_key_for_source(event.source)
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert runner._session_reasoning_overrides[session_key] == {
+            "enabled": True,
+            "effort": "ultra",
+        }
+        assert runner._reasoning_config == {"enabled": True, "effort": "ultra"}
+        assert "ultra" in result
 
     @pytest.mark.asyncio
     async def test_reasoning_command_accepts_max_session_override(self, tmp_path, monkeypatch):

@@ -182,7 +182,7 @@ gateway:
     level_disabled:            "none (비활성화됨)"
     scope_session:             "세션 재정의"
     scope_global:              "전역 설정"
-    status:                    "🧠 **추론 설정**\n\n**노력:** `{level}`\n**범위:** {scope}\n**표시:** {display}\n\n_사용법:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|reset|show|hide> [--global]`"
+    status:                    "🧠 **추론 설정**\n\n**노력:** `{level}`\n**범위:** {scope}\n**표시:** {display}\n\n_사용법:_ `/reasoning <none|minimal|low|medium|high|xhigh|max|ultra|reset|show|hide> [--global]`"
     display_on:                "켜짐 ✓"
     display_off:               "꺼짐"
     display_set_on:            "🧠 ✓ 추론 표시: **켜짐**\n**{platform}**에서 응답 전에 모델의 사고 과정이 표시됩니다."

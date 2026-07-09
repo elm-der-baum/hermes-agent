@@ -2740,19 +2740,24 @@ class GatewaySlashCommandsMixin:
                 arg=effort or raw_args.lower(),
             )
 
+        canonical_effort = (
+            parsed.get("effort", "medium")
+            if parsed.get("enabled") is not False
+            else "none"
+        )
         self._reasoning_config = parsed
         if persist_global:
-            if _save_config_key("agent.reasoning_effort", effort):
+            if _save_config_key("agent.reasoning_effort", canonical_effort):
                 self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
-                return t("gateway.reasoning.set_global", effort=effort)
+                return t("gateway.reasoning.set_global", effort=canonical_effort)
             self._set_session_reasoning_override(session_key, parsed)
             self._evict_cached_agent(session_key)
-            return t("gateway.reasoning.set_global_save_failed", effort=effort)
+            return t("gateway.reasoning.set_global_save_failed", effort=canonical_effort)
 
         self._set_session_reasoning_override(session_key, parsed)
         self._evict_cached_agent(session_key)
-        return t("gateway.reasoning.set_session", effort=effort)
+        return t("gateway.reasoning.set_session", effort=canonical_effort)
 
     async def _handle_memory_command(self, event: MessageEvent) -> str:
         """Handle /memory — review pending memory writes + toggle the approval gate.

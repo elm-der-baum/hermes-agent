@@ -42,6 +42,7 @@ from agent.prompt_builder import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    ULTRA_REASONING_GUIDANCE,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -215,6 +216,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    reasoning_config = getattr(agent, "reasoning_config", None)
+    if (
+        isinstance(reasoning_config, dict)
+        and reasoning_config.get("enabled") is not False
+        and reasoning_config.get("effort") == "ultra"
+        and "delegate_task" in agent.valid_tool_names
+    ):
+        stable_parts.append(ULTRA_REASONING_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

@@ -17,6 +17,7 @@ def _make_agent(**overrides):
         _kanban_worker_guidance="",
         _memory_store=None,
         _memory_manager=None,
+        reasoning_config=None,
         model="",
         provider="",
         platform="",
@@ -99,3 +100,25 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestUltraReasoningGuidance:
+    def test_ultra_proactively_delegates_when_tool_is_available(self):
+        agent = _make_agent(
+            valid_tool_names=["delegate_task"],
+            reasoning_config={"enabled": True, "effort": "ultra"},
+        )
+
+        stable = _stable_prompt(agent).lower()
+
+        assert "ultra" in stable
+        assert "proactive" in stable
+        assert "delegate" in stable
+
+    def test_max_does_not_enable_ultra_delegation_guidance(self):
+        agent = _make_agent(
+            valid_tool_names=["delegate_task"],
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+
+        assert "ultra reasoning mode" not in _stable_prompt(agent).lower()

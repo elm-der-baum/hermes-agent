@@ -30,18 +30,24 @@ class TestParseReasoningConfig(unittest.TestCase):
         self.assertEqual(result, {"enabled": False})
 
     def test_valid_levels(self):
-        for level in ("low", "medium", "high", "xhigh", "minimal"):
+        for level in ("low", "medium", "high", "xhigh", "minimal", "max", "ultra"):
             result = self._parse(level)
             self.assertIsNotNone(result)
             self.assertTrue(result.get("enabled"))
             self.assertEqual(result["effort"], level)
+
+    def test_u_alias_selects_ultra(self):
+        self.assertEqual(
+            self._parse("u"),
+            {"enabled": True, "effort": "ultra"},
+        )
 
     def test_empty_returns_none(self):
         self.assertIsNone(self._parse(""))
         self.assertIsNone(self._parse("  "))
 
     def test_unknown_returns_none(self):
-        self.assertIsNone(self._parse("ultra"))
+        self.assertIsNone(self._parse("extreme"))
         self.assertIsNone(self._parse("turbo"))
 
     def test_case_insensitive(self):

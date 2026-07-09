@@ -75,6 +75,20 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning", {}).get("effort") == "high"
 
+    def test_codex_ultra_uses_max_on_the_wire(self, transport):
+        """OpenAI Codex treats Ultra as client-side proactive delegation and
+        sends Max to the model endpoint; raw Ultra is rejected by that API."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=messages,
+            tools=[],
+            reasoning_config={"effort": "ultra"},
+            provider="openai-codex",
+            is_codex_backend=True,
+        )
+        assert kw.get("reasoning", {}).get("effort") == "max"
+
     def test_reasoning_disabled(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

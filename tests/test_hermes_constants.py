@@ -453,6 +453,16 @@ class TestParseReasoningEffort:
         """Every level listed in VALID_REASONING_EFFORTS is accepted as-is."""
         assert parse_reasoning_effort(level) == {"enabled": True, "effort": level}
 
+    def test_ultra_and_short_u_alias(self):
+        assert parse_reasoning_effort("ultra") == {
+            "enabled": True,
+            "effort": "ultra",
+        }
+        assert parse_reasoning_effort("u") == {
+            "enabled": True,
+            "effort": "ultra",
+        }
+
     @pytest.mark.parametrize(
         "raw, expected_effort",
         [
@@ -460,6 +470,7 @@ class TestParseReasoningEffort:
             ("High", "high"),
             ("  low  ", "low"),
             ("\tXHIGH\n", "xhigh"),
+            ("ULTRA", "ultra"),
             ("None", False),
         ],
     )
@@ -483,10 +494,10 @@ class TestParseReasoningEffort:
         """Guard against silently dropping a documented level.
 
         The docstring promises "minimal", "low", "medium", "high", "xhigh",
-        "max". If someone removes one from VALID_REASONING_EFFORTS without
+        "max", "ultra". If someone removes one from VALID_REASONING_EFFORTS without
         updating the docstring, this test will fail and force the call out.
         """
-        documented = {"minimal", "low", "medium", "high", "xhigh", "max"}
+        documented = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
         assert documented.issubset(set(VALID_REASONING_EFFORTS))
 
 

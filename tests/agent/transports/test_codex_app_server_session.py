@@ -161,6 +161,19 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_passes_model_and_ultra_reasoning(self):
+        client = FakeClient()
+        s = make_session(
+            client,
+            model="gpt-5.6-sol",
+            reasoning_effort="ultra",
+        )
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["model"] == "gpt-5.6-sol"
+        assert params["config"]["model_reasoning_effort"] == "ultra"
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
