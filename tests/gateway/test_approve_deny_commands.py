@@ -155,6 +155,88 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_approval_entries_have_stable_opaque_ids(self):
+        from tools.approval import _ApprovalEntry
+
+        e1 = _ApprovalEntry({"command": "first"})
+        e2 = _ApprovalEntry({"command": "second"})
+
+        assert isinstance(e1.approval_id, str)
+        assert e1.approval_id
+        assert e1.approval_id != e2.approval_id
+
+    def test_resolve_by_approval_id_targets_exact_entry_and_preserves_order(self):
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry,
+            _gateway_queues,
+        )
+
+        session_key = "test-exact-id"
+        first = _ApprovalEntry({"command": "first"})
+        second = _ApprovalEntry({"command": "second"})
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            approval_id=second.approval_id,
+        )
+
+        assert count == 1
+        assert second.event.is_set()
+        assert second.result == "once"
+        assert not first.event.is_set()
+        assert first.result is None
+        assert _gateway_queues[session_key] == [first]
+
+    def test_resolve_unknown_approval_id_does_not_mutate_queue(self):
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry,
+            _gateway_queues,
+        )
+
+        session_key = "test-unknown-id"
+        first = _ApprovalEntry({"command": "first"})
+        second = _ApprovalEntry({"command": "second"})
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            approval_id="approval_missing",
+        )
+
+        assert count == 0
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+        assert _gateway_queues[session_key] == [first, second]
+
+    def test_resolve_all_with_approval_id_is_ignored_without_mutating_queue(self):
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry,
+            _gateway_queues,
+        )
+
+        session_key = "test-ambiguous-id-all"
+        first = _ApprovalEntry({"command": "first"})
+        second = _ApprovalEntry({"command": "second"})
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            resolve_all=True,
+            approval_id=second.approval_id,
+        )
+
+        assert count == 0
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+        assert _gateway_queues[session_key] == [first, second]
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (

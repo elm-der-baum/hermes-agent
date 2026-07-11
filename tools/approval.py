@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -1419,11 +1420,13 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "approval_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
+        self.approval_id = str(data.get("approval_id") or f"approval_{uuid.uuid4().hex}")
         self.data = data          # command, description, pattern_keys, …
+        self.data.setdefault("approval_id", self.approval_id)
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
@@ -1462,13 +1465,17 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *approval_id* is provided, only the matching pending approval is
+    resolved.  Unknown IDs resolve nothing and leave the queue untouched.
+    Combining *approval_id* with *resolve_all* is ambiguous and resolves
+    nothing.  When *resolve_all* is True every pending approval in the session
+    is resolved at once (``/approve all``).  Otherwise only the oldest one is
+    resolved (FIFO).
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -1476,11 +1483,24 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    if approval_id is not None and resolve_all:
+        return 0
+
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if approval_id is not None:
+            target = None
+            for entry in queue:
+                if getattr(entry, "approval_id", None) == approval_id:
+                    target = entry
+                    break
+            if target is None:
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -2458,6 +2478,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         pattern_keys=list(all_keys),
         session_key=session_key,
         surface=surface,
+        approval_id=entry.approval_id,
     )
 
     # Notify the user (bridges sync agent thread → async gateway)
@@ -2530,6 +2551,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         session_key=session_key,
         surface=surface,
         choice=_outcome,
+        approval_id=entry.approval_id,
     )
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 

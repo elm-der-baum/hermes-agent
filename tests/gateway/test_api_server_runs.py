@@ -9,6 +9,8 @@ Covers:
 """
 
 import asyncio
+import json
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -82,6 +84,22 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_total_tokens = 0
 
     return mock_agent, ready, interrupted
+
+
+def _make_capturing_agent():
+    """Create a mock agent that records run_conversation kwargs and finishes."""
+    called = threading.Event()
+    mock_agent = MagicMock()
+
+    def _run(**kwargs):
+        called.set()
+        return {"final_response": "done"}
+
+    mock_agent.run_conversation.side_effect = _run
+    mock_agent.session_prompt_tokens = 0
+    mock_agent.session_completion_tokens = 0
+    mock_agent.session_total_tokens = 0
+    return mock_agent, called
 
 
 @pytest.fixture
@@ -163,6 +181,162 @@ class TestStartRun:
         assert resp.status == 400
         assert adapter._run_streams == {}
         assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_session_id_loads_persisted_history_as_sanitized_fallback(self, adapter):
+        persisted_history = [
+            {"role": "user", "content": "old question"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "tool result"},
+        ]
+        sanitized_history = persisted_history + [{"role": "assistant", "content": "clean"}]
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent, called = _make_capturing_agent()
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    return_value=persisted_history,
+                ) as mock_history,
+                patch(
+                    "agent.replay_cleanup.sanitize_replay_history",
+                    return_value=sanitized_history,
+                ) as mock_sanitize,
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "continue", "session_id": "existing-session"},
+                )
+                assert resp.status == 202
+                assert await asyncio.to_thread(called.wait, 3)
+
+        mock_history.assert_called_once_with("existing-session")
+        mock_sanitize.assert_called_once_with(persisted_history)
+        mock_agent.run_conversation.assert_called_once()
+        assert (
+            mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+            == sanitized_history
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_history_takes_precedence_over_previous_and_session(self, adapter):
+        explicit_history = [{"role": "user", "content": "explicit"}]
+        previous_history = [{"role": "assistant", "content": "previous"}]
+        adapter._response_store.put(
+            "resp_previous",
+            {"conversation_history": previous_history, "session_id": "previous-session"},
+        )
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent, called = _make_capturing_agent()
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    return_value=[{"role": "user", "content": "persisted"}],
+                ) as mock_history,
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "continue",
+                        "session_id": "explicit-session",
+                        "previous_response_id": "resp_previous",
+                        "conversation_history": explicit_history,
+                    },
+                )
+                assert resp.status == 202
+                assert await asyncio.to_thread(called.wait, 3)
+
+        mock_history.assert_not_called()
+        mock_agent.run_conversation.assert_called_once()
+        assert (
+            mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+            == explicit_history
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_history_prevents_session_fallback(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent, called = _make_capturing_agent()
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    return_value=[{"role": "user", "content": "must not leak"}],
+                ) as mock_history,
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "start clean",
+                        "session_id": "existing-session",
+                        "conversation_history": [],
+                    },
+                )
+                assert resp.status == 202
+                assert await asyncio.to_thread(called.wait, 3)
+
+        mock_history.assert_not_called()
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == []
+
+    @pytest.mark.asyncio
+    async def test_previous_response_history_takes_precedence_over_session(self, adapter):
+        previous_history = [
+            {"role": "assistant", "content": "previous", "tool_calls": [{"id": "call_prev"}]},
+            {"role": "tool", "tool_call_id": "call_prev", "content": "previous result"},
+        ]
+        adapter._response_store.put(
+            "resp_previous",
+            {"conversation_history": previous_history, "session_id": "stored-session"},
+        )
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent, called = _make_capturing_agent()
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    return_value=[{"role": "user", "content": "persisted"}],
+                ) as mock_history,
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "continue",
+                        "session_id": "client-session",
+                        "previous_response_id": "resp_previous",
+                    },
+                )
+                assert resp.status == 202
+                assert await asyncio.to_thread(called.wait, 3)
+
+        mock_history.assert_not_called()
+        mock_agent.run_conversation.assert_called_once()
+        assert (
+            mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+            == previous_history
+        )
 
     @pytest.mark.asyncio
     async def test_start_requires_auth(self, auth_adapter):
@@ -355,6 +529,162 @@ class TestRunEvents:
             "once",
             resolve_all=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_approval_by_id_resolves_exact_entry_and_preserves_fifo(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_exact_approval"
+        approval_session = "approval-session-exact"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[run_id] = approval_session
+        adapter._run_streams[run_id] = asyncio.Queue()
+
+        first = approval_mod._ApprovalEntry({"command": "first"})
+        second = approval_mod._ApprovalEntry({"command": "second"})
+        with approval_mod._lock:
+            approval_mod._gateway_queues[approval_session] = [first, second]
+
+        async with TestClient(TestServer(app)) as cli:
+            approval_resp = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once", "approval_id": second.approval_id},
+            )
+            approval_data = await approval_resp.json()
+
+        assert approval_resp.status == 200
+        assert approval_data["resolved"] == 1
+        assert approval_data["approval_id"] == second.approval_id
+        assert second.event.is_set()
+        assert second.result == "once"
+        assert not first.event.is_set()
+        assert first.result is None
+        with approval_mod._lock:
+            assert approval_mod._gateway_queues[approval_session] == [first]
+
+        event = await asyncio.wait_for(adapter._run_streams[run_id].get(), timeout=1)
+        assert event["event"] == "approval.responded"
+        assert event["approval_id"] == second.approval_id
+
+        with approval_mod._lock:
+            approval_mod._gateway_queues.pop(approval_session, None)
+
+    @pytest.mark.asyncio
+    async def test_approval_unknown_id_does_not_mutate_queue(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_unknown_approval"
+        approval_session = "approval-session-unknown"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[run_id] = approval_session
+
+        first = approval_mod._ApprovalEntry({"command": "first"})
+        second = approval_mod._ApprovalEntry({"command": "second"})
+        with approval_mod._lock:
+            approval_mod._gateway_queues[approval_session] = [first, second]
+
+        async with TestClient(TestServer(app)) as cli:
+            approval_resp = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "once", "approval_id": "approval_missing"},
+            )
+            approval_data = await approval_resp.json()
+
+        assert approval_resp.status == 409
+        assert approval_data["error"]["code"] == "approval_not_pending"
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+        with approval_mod._lock:
+            assert approval_mod._gateway_queues[approval_session] == [first, second]
+            approval_mod._gateway_queues.pop(approval_session, None)
+
+    @pytest.mark.asyncio
+    async def test_approval_request_event_status_and_response_include_id(self, adapter):
+        raw_secret = "sk-testsecret1234567890"
+        command = (
+            f"curl -H 'Authorization: Bearer {raw_secret}' https://example.invalid "
+            "&& rm -rf /important"
+        )
+        started_guard = threading.Event()
+        guard_returned = threading.Event()
+
+        def _run_with_approval(**kwargs):
+            from tools.approval import check_all_command_guards
+
+            started_guard.set()
+            result = check_all_command_guards(command, "local")
+            guard_returned.set()
+            return {"final_response": "approved" if result["approved"] else "blocked"}
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = _run_with_approval
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                patch.dict(os.environ, {"HERMES_EXEC_ASK": "1"}),
+                patch(
+                    "tools.approval.detect_dangerous_command",
+                    return_value=(True, "dangerous-test", "test approval"),
+                ),
+                patch(
+                    "tools.approval._command_matches_permanent_allowlist",
+                    return_value=False,
+                ),
+                patch("tools.approval._get_approval_mode", return_value="ask"),
+                patch("tools.approval.is_current_session_yolo_enabled", return_value=False),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "needs approval"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                assert await asyncio.to_thread(started_guard.wait, 3)
+
+                approval_event = await asyncio.wait_for(
+                    adapter._run_streams[run_id].get(),
+                    timeout=3,
+                )
+                assert approval_event["event"] == "approval.request"
+                approval_id = approval_event["approval_id"]
+                assert approval_id
+                assert raw_secret not in json.dumps(approval_event)
+
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                assert status["status"] == "waiting_for_approval"
+                assert status["pending_approvals"] == [
+                    {
+                        "approval_id": approval_id,
+                        "command": approval_event["command"],
+                        "description": approval_event["description"],
+                        "pattern_key": approval_event["pattern_key"],
+                        "pattern_keys": approval_event["pattern_keys"],
+                        "allow_permanent": approval_event["allow_permanent"],
+                        "choices": ["once", "session", "always", "deny"],
+                    }
+                ]
+                assert raw_secret not in json.dumps(status["pending_approvals"])
+
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once", "approval_id": approval_id},
+                )
+                approval_data = await approval_resp.json()
+                assert approval_resp.status == 200
+                assert approval_data["approval_id"] == approval_id
+
+                responded_event = await asyncio.wait_for(
+                    adapter._run_streams[run_id].get(),
+                    timeout=3,
+                )
+                assert responded_event["event"] == "approval.responded"
+                assert responded_event["approval_id"] == approval_id
+                assert await asyncio.to_thread(guard_returned.wait, 3)
+
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                assert status.get("pending_approvals") == []
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):

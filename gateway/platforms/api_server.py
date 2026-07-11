@@ -4103,6 +4103,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_APPROVAL_CHOICES = ["once", "session", "always", "deny"]
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -4115,9 +4116,53 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": now,
         })
         current.setdefault("created_at", fields.pop("created_at", now))
+        if status in {"completed", "failed", "cancelled", "stopping"}:
+            fields.setdefault("pending_approvals", [])
         current.update(fields)
         self._run_statuses[run_id] = current
         return current
+
+    def _sanitize_run_pending_approval(self, approval_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the recoverable approval fields safe for API status/events."""
+        data = dict(approval_data or {})
+        if "command" in data:
+            from gateway.run import _redact_approval_command
+
+            data["command"] = _redact_approval_command(data.get("command"))
+        if "description" in data:
+            data["description"] = redact_sensitive_text(str(data.get("description") or ""))
+
+        pending: Dict[str, Any] = {}
+        for key in (
+            "approval_id",
+            "command",
+            "description",
+            "pattern_key",
+            "pattern_keys",
+            "allow_permanent",
+        ):
+            if key in data:
+                pending[key] = data[key]
+        pending["choices"] = list(self._RUN_APPROVAL_CHOICES)
+        return pending
+
+    def _pending_approvals_for_run(self, run_id: str) -> List[Dict[str, Any]]:
+        approval_session_key = self._run_approval_sessions.get(run_id)
+        if not approval_session_key:
+            return []
+        try:
+            from tools import approval as approval_mod
+
+            with approval_mod._lock:
+                entries = list(approval_mod._gateway_queues.get(approval_session_key, []))
+            return [self._sanitize_run_pending_approval(entry.data) for entry in entries]
+        except Exception:
+            logger.debug(
+                "[api_server] failed to snapshot approvals for run %s",
+                run_id,
+                exc_info=True,
+            )
+            return []
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -4197,12 +4242,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        requested_session_id = body.get("session_id")
 
         # Accept explicit conversation_history from the request body.
-        # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        # Precedence: explicit conversation_history > previous_response_id >
+        # multi-message input history > persisted session history.
+        conversation_history: List[Dict[str, Any]] = []
+        explicit_history_provided = "conversation_history" in body
         raw_history = body.get("conversation_history")
-        if raw_history:
+        if explicit_history_provided:
             if not isinstance(raw_history, list):
                 return web.json_response(
                     _openai_error("'conversation_history' must be an array of message objects"),
@@ -4219,7 +4267,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
-        if not conversation_history and previous_response_id:
+        if not explicit_history_provided and not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
@@ -4230,7 +4278,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        if not explicit_history_provided and not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                     content = msg["content"]
@@ -4242,8 +4290,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        if not explicit_history_provided and not conversation_history and requested_session_id:
+            persisted_history = self._conversation_history_for_session(str(requested_session_id))
+            if persisted_history:
+                from agent.replay_cleanup import sanitize_replay_history
+
+                conversation_history = sanitize_replay_history(persisted_history)
+
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        session_id = requested_session_id or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -4300,24 +4355,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
+                    # Keep the redaction assignment in this callback: an AST
+                    # regression test guards this transport's egress boundary.
                     if "command" in event:
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    event = self._sanitize_run_pending_approval(event)
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": ["once", "session", "always", "deny"],
                     })
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        pending_approvals=(
+                            self._pending_approvals_for_run(run_id)
+                            or [self._sanitize_run_pending_approval(event)]
+                        ),
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -4587,13 +4644,19 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        approval_id = body.get("approval_id")
+        if approval_id is not None:
+            approval_id = str(approval_id)
         try:
             from tools.approval import resolve_gateway_approval
 
+            resolve_kwargs = {"resolve_all": resolve_all}
+            if approval_id is not None:
+                resolve_kwargs["approval_id"] = approval_id
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
-                resolve_all=resolve_all,
+                **resolve_kwargs,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -4608,26 +4671,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        pending_approvals = self._pending_approvals_for_run(run_id)
+        self._set_run_status(
+            run_id,
+            "waiting_for_approval" if pending_approvals else "running",
+            last_event="approval.responded",
+            pending_approvals=pending_approvals,
+        )
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
+                event = {
                     "event": "approval.responded",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
-                })
+                }
+                if approval_id is not None:
+                    event["approval_id"] = approval_id
+                q.put_nowait(event)
             except Exception:
                 pass
 
-        return web.json_response({
+        response = {
             "object": "hermes.run.approval_response",
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
-        })
+        }
+        if approval_id is not None:
+            response["approval_id"] = approval_id
+        return web.json_response(response)
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
