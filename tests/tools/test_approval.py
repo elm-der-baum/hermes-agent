@@ -2095,6 +2095,7 @@ class TestApprovalTimeoutIsNotConsent:
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         getattr(mod, "_closed_gateway_sessions", set()).clear()
+        getattr(mod, "_gateway_generations", {}).clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
@@ -2119,6 +2120,7 @@ class TestApprovalTimeoutIsNotConsent:
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         getattr(mod, "_closed_gateway_sessions", set()).clear()
+        getattr(mod, "_gateway_generations", {}).clear()
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -2210,6 +2212,36 @@ class TestApprovalTimeoutIsNotConsent:
             "notify_failed": True,
         }]
         assert mod._gateway_queues.get(session_key) is None
+
+    def test_stale_run_cannot_enqueue_or_unregister_new_approval_generation(self):
+        from tools import approval as mod
+
+        session_key = "stale-approval-generation"
+        old_cb = lambda _payload: None
+        new_cb = lambda _payload: None
+        old_generation = mod.register_gateway_notify(session_key, old_cb)
+        token = mod.set_current_session_generation(old_generation)
+        try:
+            mod.close_session(session_key)
+            new_generation = mod.register_gateway_notify(session_key, new_cb)
+
+            result = mod._await_gateway_decision(
+                session_key,
+                old_cb,
+                {"command": "rm stale", "description": "stale"},
+                timeout_seconds=0,
+            )
+            mod.unregister_gateway_notify(
+                session_key, generation=old_generation
+            )
+
+            assert result["notify_failed"] is True
+            assert mod._gateway_notify_cbs.get(session_key) is new_cb
+            assert session_key not in mod._closed_gateway_sessions
+            assert new_generation != old_generation
+        finally:
+            mod.reset_current_session_generation(token)
+            mod.close_session(session_key)
 
     def test_zero_gateway_timeout_waits_for_explicit_decision(self, monkeypatch):
         """gateway_timeout=0 means unlimited while still requiring real consent."""

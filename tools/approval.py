@@ -42,6 +42,10 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+_approval_session_generation: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "approval_session_generation",
+    default=None,
+)
 _approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_turn_id",
     default="",
@@ -129,6 +133,20 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_session_generation(
+    generation: Optional[int],
+) -> contextvars.Token[Optional[int]]:
+    """Bind the active approval run generation to the current context."""
+    return _approval_session_generation.set(generation)
+
+
+def reset_current_session_generation(
+    token: contextvars.Token[Optional[int]],
+) -> None:
+    """Restore the prior approval run generation context."""
+    _approval_session_generation.reset(token)
 
 
 def set_current_observability_context(
@@ -1437,10 +1455,11 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 _closed_gateway_sessions: set[str] = set()
+_gateway_generations: dict[str, int] = {}
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
-    """Register a per-session callback for sending approval requests to the user.
+def register_gateway_notify(session_key: str, cb) -> int:
+    """Register an approval callback and return a fresh run-generation token.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
     *approval_data* contains ``command``, ``description``, and
@@ -1448,22 +1467,33 @@ def register_gateway_notify(session_key: str, cb) -> None:
     thread, must schedule the actual send on the event loop).
     """
     with _lock:
+        generation = _gateway_generations.get(session_key, 0) + 1
+        _gateway_generations[session_key] = generation
         _closed_gateway_sessions.discard(session_key)
         _gateway_notify_cbs[session_key] = cb
+        return generation
 
 
-def unregister_gateway_notify(session_key: str) -> None:
-    """Unregister the per-session gateway approval callback.
+def unregister_gateway_notify(
+    session_key: str, *, generation: Optional[int] = None
+) -> None:
+    """Unregister one run's gateway approval callback.
 
-    Signals ALL blocked threads for this session so they don't hang forever
-    (e.g. when the agent run finishes or is interrupted).
+    A stale run-generation cannot unregister a newer run. Matching cleanup
+    signals all blocked threads so they fail closed instead of hanging.
     """
     with _lock:
+        if (
+            generation is not None
+            and _gateway_generations.get(session_key) != generation
+        ):
+            return
         _closed_gateway_sessions.add(session_key)
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
-    for entry in entries:
-        entry.event.set()
+        for entry in entries:
+            entry.result = "deny"
+            entry.event.set()
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2487,8 +2517,13 @@ def _await_gateway_decision(
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
     entry = _ApprovalEntry(approval_data)
+    generation = _approval_session_generation.get()
     with _lock:
-        if session_key in _closed_gateway_sessions:
+        stale_generation = (
+            generation is not None
+            and _gateway_generations.get(session_key) != generation
+        )
+        if session_key in _closed_gateway_sessions or stale_generation:
             return {"resolved": False, "choice": None, "notify_failed": True}
         _gateway_queues.setdefault(session_key, []).append(entry)
 

@@ -18500,7 +18500,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # to the user immediately.
             from tools.approval import (
                 register_gateway_notify,
+                reset_current_session_generation,
                 reset_current_session_key,
+                set_current_session_generation,
                 set_current_session_key,
                 unregister_gateway_notify,
             )
@@ -18771,7 +18773,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.clarify_gateway import open_session as _open_clarify_session
 
             _clarify_generation = _open_clarify_session(_approval_session_key)
-            register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            _approval_generation = register_gateway_notify(
+                _approval_session_key, _approval_notify_sync
+            )
+            _approval_generation_token = set_current_session_generation(
+                _approval_generation
+            )
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -18822,7 +18829,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
-                unregister_gateway_notify(_approval_session_key)
+                unregister_gateway_notify(
+                    _approval_session_key, generation=_approval_generation
+                )
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
@@ -18833,6 +18842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     pass
+                reset_current_session_generation(_approval_generation_token)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
