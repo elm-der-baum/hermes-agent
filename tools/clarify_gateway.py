@@ -174,9 +174,9 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
         entry = _entries.get(clarify_id)
         if entry is None:
             return False
-    entry.response = str(response) if response is not None else ""
-    entry.event.set()
-    return True
+        entry.response = str(response) if response is not None else ""
+        entry.event.set()
+        return True
 
 
 def get_pending_for_session(
@@ -282,14 +282,20 @@ def close_session(session_key: str) -> int:
         _notify_cbs.pop(session_key, None)
         ids = list(_session_index.pop(session_key, []) or [])
         entries = [_entries.pop(cid, None) for cid in ids]
-    cancelled = 0
-    for entry in entries:
-        if entry is None:
-            continue
-        entry.response = ""
-        entry.event.set()
-        cancelled += 1
-    return cancelled
+        cancelled = 0
+        for entry in entries:
+            if entry is None:
+                continue
+            entry.response = ""
+            entry.event.set()
+            cancelled += 1
+        return cancelled
+
+
+def open_session(session_key: str) -> None:
+    """Allow a newly started run to register clarifications for the session."""
+    with _lock:
+        _closed_sessions.discard(session_key)
 
 
 # =========================================================================

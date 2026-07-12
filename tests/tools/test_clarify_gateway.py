@@ -296,6 +296,51 @@ class TestClarifyPrimitive:
         assert was_alive is False
         assert result == [None]
 
+    def test_open_session_allows_a_new_run_to_register_clarification(self):
+        from tools import clarify_gateway as cm
+
+        cm.close_session("reopened-session")
+        cm.open_session("reopened-session")
+        entry = cm.register("fresh", "reopened-session", "Fresh?", None)
+
+        assert entry.event.is_set() is False
+        assert cm.get_pending_for_session("reopened-session") is entry
+        cm.clear_session("reopened-session")
+
+    def test_close_wins_over_response_resolver_captured_before_boundary(self):
+        from tools import clarify_gateway as cm
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingResponse:
+            def __str__(self):
+                entered.set()
+                release.wait(timeout=1)
+                return "ANSWER"
+
+        entry = cm.register("racing", "racing-session", "Race?", None)
+        resolver = threading.Thread(
+            target=lambda: cm.resolve_gateway_clarify("racing", BlockingResponse()),
+            daemon=True,
+        )
+        resolver.start()
+        assert entered.wait(timeout=1)
+
+        closer = threading.Thread(
+            target=lambda: cm.close_session("racing-session"),
+            daemon=True,
+        )
+        closer.start()
+        release.set()
+        resolver.join(timeout=1)
+        closer.join(timeout=1)
+
+        assert resolver.is_alive() is False
+        assert closer.is_alive() is False
+        assert entry.response == ""
+        assert entry.event.is_set()
+
 
 class TestGatewayTextIntercept:
     """The gateway's _handle_message intercepts text replies to pending clarifies."""
