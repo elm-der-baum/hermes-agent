@@ -332,10 +332,13 @@ class TestClarifyPrimitive:
             daemon=True,
         )
         closer.start()
+        closer.join(timeout=0.2)
+        closed_before_release = closer.is_alive() is False
         release.set()
         resolver.join(timeout=1)
         closer.join(timeout=1)
 
+        assert closed_before_release
         assert resolver.is_alive() is False
         assert closer.is_alive() is False
         assert entry.response == ""

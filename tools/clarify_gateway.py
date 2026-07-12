@@ -170,11 +170,12 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     Returns True if an entry was found and resolved, False otherwise
     (already resolved, expired, or never existed).
     """
+    normalized_response = str(response) if response is not None else ""
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None:
             return False
-        entry.response = str(response) if response is not None else ""
+        entry.response = normalized_response
         entry.event.set()
         return True
 
