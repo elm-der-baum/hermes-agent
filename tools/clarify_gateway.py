@@ -69,6 +69,7 @@ _entries: Dict[str, _ClarifyEntry] = {}
 # session_key → list[clarify_id]  (FIFO; for text-fallback intercept and session cleanup)
 _session_index: Dict[str, List[str]] = {}
 _closed_sessions: set[str] = set()
+_session_generations: Dict[str, int] = {}
 
 
 # =========================================================================
@@ -80,6 +81,8 @@ def register(
     session_key: str,
     question: str,
     choices: Optional[List[str]],
+    *,
+    generation: Optional[int] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -95,7 +98,11 @@ def register(
         awaiting_text=not bool(choices),
     )
     with _lock:
-        if session_key in _closed_sessions:
+        stale_generation = (
+            generation is not None
+            and _session_generations.get(session_key) != generation
+        )
+        if session_key in _closed_sessions or stale_generation:
             entry.response = ""
             entry.event.set()
             return entry
@@ -276,9 +283,14 @@ def clear_session(session_key: str) -> int:
     return cancelled
 
 
-def close_session(session_key: str) -> int:
-    """Close a session atomically and cancel all pending clarifications."""
+def close_session(session_key: str, *, generation: Optional[int] = None) -> int:
+    """Close a session generation and cancel all of its pending clarifications."""
     with _lock:
+        if (
+            generation is not None
+            and _session_generations.get(session_key) != generation
+        ):
+            return 0
         _closed_sessions.add(session_key)
         _notify_cbs.pop(session_key, None)
         ids = list(_session_index.pop(session_key, []) or [])
@@ -293,10 +305,13 @@ def close_session(session_key: str) -> int:
         return cancelled
 
 
-def open_session(session_key: str) -> None:
-    """Allow a newly started run to register clarifications for the session."""
+def open_session(session_key: str) -> int:
+    """Open and return a fresh generation token for a newly started run."""
     with _lock:
+        generation = _session_generations.get(session_key, 0) + 1
+        _session_generations[session_key] = generation
         _closed_sessions.discard(session_key)
+        return generation
 
 
 # =========================================================================

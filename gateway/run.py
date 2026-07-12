@@ -18377,6 +18377,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key or "",
                     question=question,
                     choices=list(choices) if choices else None,
+                    generation=_clarify_generation,
                 )
 
                 # Pause typing — like approval, we don't want a "thinking..."
@@ -18769,7 +18770,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_token = set_current_session_key(_approval_session_key)
             from tools.clarify_gateway import open_session as _open_clarify_session
 
-            _open_clarify_session(_approval_session_key)
+            _clarify_generation = _open_clarify_session(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
@@ -18827,7 +18828,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # completion, gateway shutdown).  Idempotent.
                 try:
                     from tools.clarify_gateway import close_session as _close_clarify_session
-                    _close_clarify_session(_approval_session_key)
+                    _close_clarify_session(
+                        _approval_session_key, generation=_clarify_generation
+                    )
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)

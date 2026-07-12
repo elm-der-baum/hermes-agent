@@ -22,6 +22,7 @@ def _clear_clarify_state():
         cm._session_index.clear()
         cm._notify_cbs.clear()
         getattr(cm, "_closed_sessions", set()).clear()
+        getattr(cm, "_session_generations", {}).clear()
 
 
 class TestClarifyPrimitive:
@@ -300,12 +301,39 @@ class TestClarifyPrimitive:
         from tools import clarify_gateway as cm
 
         cm.close_session("reopened-session")
-        cm.open_session("reopened-session")
-        entry = cm.register("fresh", "reopened-session", "Fresh?", None)
+        generation = cm.open_session("reopened-session")
+        entry = cm.register(
+            "fresh", "reopened-session", "Fresh?", None,
+            generation=generation,
+        )
 
         assert entry.event.is_set() is False
         assert cm.get_pending_for_session("reopened-session") is entry
         cm.clear_session("reopened-session")
+
+    def test_stale_run_cannot_register_or_close_after_new_run_reopens(self):
+        from tools import clarify_gateway as cm
+
+        old_generation = cm.open_session("generation-session")
+        cm.close_session("generation-session", generation=old_generation)
+        new_generation = cm.open_session("generation-session")
+
+        fresh = cm.register(
+            "fresh-generation", "generation-session", "Fresh?", None,
+            generation=new_generation,
+        )
+        stale = cm.register(
+            "stale-generation", "generation-session", "Stale?", None,
+            generation=old_generation,
+        )
+        assert cm.close_session(
+            "generation-session", generation=old_generation
+        ) == 0
+
+        assert fresh.event.is_set() is False
+        assert stale.event.is_set()
+        assert cm.get_pending_for_session("generation-session") is fresh
+        cm.close_session("generation-session", generation=new_generation)
 
     def test_close_wins_over_response_resolver_captured_before_boundary(self):
         from tools import clarify_gateway as cm
