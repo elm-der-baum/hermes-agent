@@ -136,6 +136,7 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+_closed_prompt_sessions: set[str] = set()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -701,12 +702,14 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     """
     if not session:
         return
+    if sid := session.get("_sid"):
+        _close_prompt_session(str(sid))
     _finalize_session(session, end_reason=end_reason)
     try:
-        from tools.approval import unregister_gateway_notify
+        from tools.approval import close_session
 
         if key := session.get("session_key"):
-            unregister_gateway_notify(key)
+            close_session(key)
     except Exception:
         pass
     try:
@@ -1140,11 +1143,11 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
+def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
-    write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    return write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -1159,7 +1162,8 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
         from gateway.run import _redact_approval_command
 
         payload["command"] = _redact_approval_command(payload.get("command"))
-    _emit("approval.request", sid, payload)
+    if _emit("approval.request", sid, payload) is False:
+        raise RuntimeError("TUI approval request could not be delivered")
 
 
 def _status_update(sid: str, kind: str, text: str | None = None):
@@ -2031,16 +2035,41 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+def _configured_clarify_timeout(default: float = 300) -> float:
+    """Return the global clarify timeout; zero means wait without a deadline."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    clarify_cfg = cfg.get("clarify", {}) if isinstance(cfg, dict) else {}
+    raw = (
+        agent_cfg.get("clarify_timeout", clarify_cfg.get("timeout", default))
+        if isinstance(agent_cfg, dict) and isinstance(clarify_cfg, dict)
+        else default
+    )
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    return normalize_human_timeout(raw, default=default)
+
+
+def _block(event: str, sid: str, payload: dict, timeout: float = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
+        if sid in _closed_prompt_sessions:
+            return ""
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
     try:
-        _emit(event, sid, payload)
-        ev.wait(timeout=timeout)
+        if _emit(event, sid, payload) is False:
+            return ""
+        from hermes_cli.human_wait import wait_timeout
+
+        ev.wait(timeout=wait_timeout(timeout, default=300))
     finally:
         with _prompt_lock:
             _pending.pop(rid, None)
@@ -2063,6 +2092,21 @@ def _clear_pending(sid: str | None = None) -> None:
             if sid is None or owner_sid == sid:
                 _answers[rid] = ""
                 ev.set()
+
+
+def _close_prompt_session(sid: str) -> None:
+    """Atomically reject new prompts and release existing ones for *sid*."""
+    with _prompt_lock:
+        _closed_prompt_sessions.add(sid)
+        for rid, (owner_sid, ev) in list(_pending.items()):
+            if owner_sid == sid:
+                _answers[rid] = ""
+                ev.set()
+
+
+def _open_prompt_session(sid: str) -> None:
+    with _prompt_lock:
+        _closed_prompt_sessions.discard(sid)
 
 
 # ── Agent factory ────────────────────────────────────────────────────
@@ -3887,7 +3931,10 @@ def _agent_cbs(sid: str) -> dict:
             "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+            "clarify.request",
+            sid,
+            {"question": q, "choices": c},
+            timeout=_configured_clarify_timeout(),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -4635,6 +4682,7 @@ def _init_session(
 ):
     now = time.time()
     with _sessions_lock:
+        _open_prompt_session(sid)
         _sessions[sid] = {
             "agent": agent,
             "session_key": key,
@@ -5208,6 +5256,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4090, limit_message)
 
     with _sessions_lock:
+        _open_prompt_session(sid)
         _sessions[sid] = {
             "agent": None,
             "agent_error": None,
@@ -5508,6 +5557,7 @@ def _claim_or_reuse_live(
                 lease.release()
             return live
         with _sessions_lock:
+            _open_prompt_session(sid)
             _sessions[sid] = record
             _register_session_cwd(_sessions[sid])
     return None

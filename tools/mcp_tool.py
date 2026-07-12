@@ -932,7 +932,12 @@ def _format_connect_error(exc: BaseException) -> str:
 # Sampling -- server-initiated LLM requests (MCP sampling/createMessage)
 # ---------------------------------------------------------------------------
 
-def _safe_numeric(value, default, coerce=int, minimum=1):
+def _safe_numeric(
+    value: Any,
+    default: Any,
+    coerce: Callable[[Any], Any] = int,
+    minimum: Any = 1,
+) -> Any:
     """Coerce a config value to a numeric type, returning *default* on failure.
 
     Handles string values from YAML (e.g. ``"10"`` instead of ``10``),
@@ -1363,18 +1368,29 @@ class ElicitationHandler:
     The server treats this as the user not approving.
     """
 
-    # Outer cap for the approval await. ``prompt_dangerous_approval`` runs
-    # its own input() timeout via the approval-config value; this is an
-    # asyncio-side safety net so the MCP event loop never blocks
-    # indefinitely if the inner timeout machinery is bypassed.
+    # Outer grace for finite approval waits. Unlimited waits intentionally skip
+    # asyncio.wait_for; explicit session interruption still releases the inner
+    # approval primitive.
     _OUTER_TIMEOUT_GRACE_SECONDS = 5
 
     def __init__(self, server_name: str, config: dict, owner: Optional["MCPServerTask"] = None):
         self.server_name = server_name
-        # Per-elicitation timeout. Default 5 min mirrors the gateway approval
-        # default so users on async surfaces (Telegram, Slack) have time to
-        # respond before the server gives up.
-        self.timeout = _safe_numeric(config.get("timeout", 300), 300, float)
+        # Per-elicitation overrides win. Otherwise inherit the global gateway
+        # approval timeout so MCP questions follow the same cross-surface policy.
+        timeout_value = config.get("timeout")
+        if timeout_value is None:
+            try:
+                from hermes_cli.config import load_config
+
+                approvals = (load_config() or {}).get("approvals", {}) or {}
+                timeout_value = approvals.get(
+                    "gateway_timeout", approvals.get("timeout", 300)
+                )
+            except Exception:
+                timeout_value = 300
+        from hermes_cli.human_wait import normalize_human_timeout
+
+        self.timeout = normalize_human_timeout(timeout_value, default=300)
         # Back-reference to the MCPServerTask so we can read the agent's
         # captured contextvars snapshot at elicitation time. Optional so
         # the handler stays unit-testable in isolation.
@@ -1458,7 +1474,7 @@ class ElicitationHandler:
                 return request_elicitation_consent(
                     message,
                     description,
-                    timeout_seconds=int(self.timeout),
+                    timeout_seconds=self.timeout,
                     surface=f"mcp-elicitation/{self.server_name}",
                 )
             # Context.run can only execute a context once — copy to allow
@@ -1467,15 +1483,19 @@ class ElicitationHandler:
                 request_elicitation_consent,
                 message,
                 description,
-                timeout_seconds=int(self.timeout),
+                timeout_seconds=self.timeout,
                 surface=f"mcp-elicitation/{self.server_name}",
             )
 
         try:
-            answer = await asyncio.wait_for(
-                asyncio.to_thread(_invoke_consent),
-                timeout=self.timeout + self._OUTER_TIMEOUT_GRACE_SECONDS,
-            )
+            consent_wait = asyncio.to_thread(_invoke_consent)
+            if self.timeout == 0:
+                answer = await consent_wait
+            else:
+                answer = await asyncio.wait_for(
+                    consent_wait,
+                    timeout=self.timeout + self._OUTER_TIMEOUT_GRACE_SECONDS,
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "MCP server '%s' elicitation timed out after %ds",

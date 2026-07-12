@@ -41,6 +41,7 @@ def server():
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()
+        getattr(mod, "_closed_prompt_sessions", set()).clear()
 
 
 @pytest.fixture()
@@ -262,6 +263,163 @@ def test_block_and_respond(capture):
 
     threading.Event().wait(0.1)
     assert result[0] == "my_answer"
+
+
+def test_block_zero_timeout_waits_until_response(capture):
+    server, _ = capture
+    result = [None]
+
+    thread = threading.Thread(
+        target=lambda: result.__setitem__(
+            0,
+            server._block("clarify.request", "s1", {"q": "?"}, timeout=0),
+        ),
+        daemon=True,
+    )
+    thread.start()
+
+    for _ in range(100):
+        if server._pending:
+            break
+        threading.Event().wait(0.01)
+
+    assert server._pending, "unlimited TUI prompt expired before a response"
+    assert thread.is_alive()
+
+    rid = next(iter(server._pending))
+    server._answers[rid] = "later_answer"
+    _, ev = server._pending[rid]
+    ev.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result[0] == "later_answer"
+
+
+def test_teardown_releases_unlimited_prompt(server, monkeypatch):
+    result = [None]
+    thread = threading.Thread(
+        target=lambda: result.__setitem__(
+            0,
+            server._block("clarify.request", "sid-close", {"question": "Q?"}, timeout=0),
+        ),
+        daemon=True,
+    )
+    thread.start()
+
+    deadline = time.time() + 1
+    while time.time() < deadline:
+        with server._prompt_lock:
+            if server._pending:
+                break
+        time.sleep(0.01)
+
+    monkeypatch.setattr(server, "_finalize_session", lambda *_a, **_k: None)
+    from tools import approval as approval_mod
+
+    approval_entry = approval_mod._ApprovalEntry(
+        {"command": "danger", "description": "test"}
+    )
+    with approval_mod._lock:
+        approval_mod._gateway_queues["tui-session"] = [approval_entry]
+
+    server._teardown_session(
+        {"_sid": "sid-close", "session_key": "tui-session"}
+    )
+    thread.join(timeout=1)
+    was_alive = thread.is_alive()
+    if was_alive:
+        server._clear_pending("sid-close")
+        thread.join(timeout=1)
+
+    assert not was_alive, "session teardown left an unlimited prompt blocked"
+    assert result == [""]
+    assert approval_entry.event.is_set()
+    assert approval_entry.result == "deny"
+
+
+def test_prompt_started_after_teardown_is_rejected_without_blocking(server, monkeypatch):
+    sid = "sid-closed-race"
+    session = {"_sid": sid, "session_key": "tui-closed-race"}
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_finalize_session", lambda *_a, **_k: None)
+
+    assert server._close_session_by_id(sid)
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            server._block("clarify.request", sid, {"question": "Q?"}, timeout=0)
+        ),
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=0.2)
+    was_alive = thread.is_alive()
+    server._clear_pending(sid)
+    thread.join(timeout=1)
+
+    assert not was_alive, "prompt registered after teardown and blocked"
+    assert result == [""]
+    assert not server._pending
+
+
+def test_tui_approval_delivery_false_raises(server):
+    sid = "sid-failed-delivery"
+    transport = MagicMock()
+    transport.write.return_value = False
+    server._sessions[sid] = {"transport": transport}
+
+    with pytest.raises(RuntimeError, match="could not be delivered"):
+        server._emit_approval_request(sid, {"description": "danger"})
+
+
+def test_tui_block_delivery_false_returns_without_waiting(server):
+    sid = "sid-failed-clarify-delivery"
+    transport = MagicMock()
+    transport.write.return_value = False
+    server._sessions[sid] = {"transport": transport}
+
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            server._block("clarify.request", sid, {"question": "Q?"}, timeout=0)
+        ),
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=0.2)
+    was_alive = thread.is_alive()
+    server._clear_pending(sid)
+    thread.join(timeout=1)
+
+    assert was_alive is False
+    assert result == [""]
+    assert not server._pending
+
+
+def test_agent_clarify_callback_uses_configured_unlimited_timeout(server, monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agent": {"clarify_timeout": 0}},
+    )
+
+    def fake_block(event, sid, payload, timeout=300):
+        seen.update(event=event, sid=sid, payload=payload, timeout=timeout)
+        return "answer"
+
+    monkeypatch.setattr(server, "_block", fake_block)
+
+    result = server._agent_cbs("s1")["clarify_callback"]("Question?", ["A"])
+
+    assert result == "answer"
+    assert seen == {
+        "event": "clarify.request",
+        "sid": "s1",
+        "payload": {"question": "Question?", "choices": ["A"]},
+        "timeout": 0,
+    }
 
 
 def test_clear_pending(server):

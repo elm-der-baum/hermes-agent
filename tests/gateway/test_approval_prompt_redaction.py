@@ -17,7 +17,9 @@ the redactor regexes so the assertions stay meaningful, but contain no real
 or real-looking key, so secret scanners do not flag this file.
 """
 
-from gateway.run import _redact_approval_command
+import pytest
+
+from gateway.run import _redact_approval_command, _require_send_success
 
 # Synthetic, scanner-safe credential fixtures. Each matches its redactor
 # regex (ghp_/sk-/JWT) but is unmistakably fake -- a run of X's, never a
@@ -65,6 +67,21 @@ class TestRedactApprovalCommand:
     def test_handles_none_and_empty(self):
         assert _redact_approval_command("") == ""
         assert _redact_approval_command(None) == ""
+
+
+class TestApprovalDeliveryResult:
+    def test_success_result_is_accepted(self):
+        from types import SimpleNamespace
+
+        _require_send_success(SimpleNamespace(success=True, error=None), "approval")
+
+    @pytest.mark.parametrize("result", [None, False])
+    def test_missing_or_false_result_raises(self, result):
+        from types import SimpleNamespace
+
+        value = result if result is None else SimpleNamespace(success=False, error="down")
+        with pytest.raises(RuntimeError, match="approval"):
+            _require_send_success(value, "approval")
 
 
 class TestApprovalCommandWiring:

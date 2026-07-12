@@ -1890,6 +1890,16 @@ approvals:
 
 Smart mode is particularly useful for reducing approval fatigue — it lets the agent work more autonomously on safe operations while still catching genuinely destructive commands.
 
+### Approval wait timeouts
+
+```yaml
+approvals:
+  timeout: 60          # CLI and ACP
+  gateway_timeout: 300 # Messaging, TUI gateway and API/WebUI
+```
+
+Positive values are seconds. Set either value to **exactly `0`** to wait until the user explicitly approves, denies, or interrupts/closes the session; silence never becomes consent. Negative, malformed, and non-finite values use the finite default instead of disabling expiry.
+
 :::warning
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
 :::
@@ -1952,8 +1962,12 @@ Configure the clarification prompt behavior:
 
 ```yaml
 clarify:
-  timeout: 120                 # Seconds to wait for user clarification response
+  timeout: 120          # CLI clarification prompts
+agent:
+  clarify_timeout: 3600 # Messaging and TUI/WebUI clarification prompts
 ```
+
+Positive values are seconds. Set both to **exactly `0`** to keep clarification prompts open until the user answers or explicitly interrupts/closes the session. Negative, malformed, and non-finite values use the finite default.
 
 ## Context Files (SOUL.md, AGENTS.md)
 

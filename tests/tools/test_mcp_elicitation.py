@@ -69,6 +69,32 @@ class TestSchemaSummary:
 
 
 class TestElicitationHandlerFormMode:
+    def test_global_zero_timeout_waits_without_outer_deadline(self):
+        wait_for_calls = []
+
+        async def tracking_wait_for(awaitable, timeout):
+            wait_for_calls.append(timeout)
+            return await awaitable
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"approvals": {"gateway_timeout": 0}},
+        ):
+            handler = ElicitationHandler("pay", {})
+
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="accept",
+        ), patch(
+            "tools.mcp_tool.asyncio.wait_for",
+            side_effect=tracking_wait_for,
+        ):
+            result = asyncio.run(handler(context=None, params=_form_params()))
+
+        assert handler.timeout == 0
+        assert result.action == "accept"
+        assert wait_for_calls == []
+
     def test_user_accepts_once_returns_accept(self):
         handler = ElicitationHandler("pay", {"timeout": 5})
         params = _form_params(
@@ -147,15 +173,14 @@ class TestElicitationHandlerFailureModes:
         monkeypatch.setattr(
             ElicitationHandler, "_OUTER_TIMEOUT_GRACE_SECONDS", 0
         )
-        # _safe_numeric clamps `timeout` to a minimum of 1s, so the
-        # effective wait_for budget is 1s here. Stall longer than that
-        # so the wait_for reliably fires TimeoutError.
+        # A short positive value remains finite. Stall beyond it so the
+        # asyncio-side wrapper reliably fires TimeoutError.
         handler = ElicitationHandler("pay", {"timeout": 0.05})
         params = _form_params()
 
         def stall(*_args, **_kwargs):
             import time as _t
-            _t.sleep(2)
+            _t.sleep(0.2)
             return "accept"
 
         with patch("tools.approval.request_elicitation_consent", side_effect=stall):
@@ -172,7 +197,11 @@ class TestElicitationHandlerWiring:
         assert kwargs == {"elicitation_callback": handler}
 
     def test_default_timeout_is_300_seconds(self):
-        handler = ElicitationHandler("pay", {})
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"approvals": {"gateway_timeout": 300}},
+        ):
+            handler = ElicitationHandler("pay", {})
         assert handler.timeout == 300
 
     def test_disabled_config_does_not_construct_handler(self):

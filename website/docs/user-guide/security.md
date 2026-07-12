@@ -31,7 +31,8 @@ The approval system supports three modes, configured via `approvals.mode` in `~/
 ```yaml
 approvals:
   mode: manual                    # manual | smart | off
-  timeout: 60                     # seconds to wait for user response (default: 60)
+  timeout: 60                     # CLI/ACP wait; 0 means no automatic expiry
+  gateway_timeout: 300            # Messaging/TUI/WebUI wait; 0 means no automatic expiry
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
@@ -42,10 +43,13 @@ The full set of keys:
 | Key | Default | What it controls |
 |---|---|---|
 | `mode` | `manual` | Approval policy for dangerous shell commands — see the table below. |
-| `timeout` | `60` | Seconds Hermes waits for an approval reply before timing out. |
+| `timeout` | `60` | Seconds the CLI and ACP wait for an approval reply. `0` waits until explicit response or interruption. |
+| `gateway_timeout` | `300` | Seconds messaging, TUI gateway, and API/WebUI surfaces wait for approval. `0` waits until explicit response or interruption. Silence never counts as approval. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |
+
+Only **exactly `0`** disables automatic expiry. Negative, malformed, or non-finite values fall back to the documented finite default. Unlimited waits remain fail-closed and end when the user answers or the session is interrupted, closed, replaced with `/new`, stopped, or the process exits. Native platform controls may have their own API lifetime (for example, Discord buttons); the backend request stays pending and remains answerable through the platform's typed reply or command path.
 
 | Mode | Behavior |
 |------|----------|

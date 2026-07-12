@@ -1096,16 +1096,19 @@ DEFAULT_CONFIG = {
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
         # Maximum time (seconds) the gateway will block an agent waiting for
-        # a clarify-tool response from the user.  Hit this and the agent
-        # unblocks with "[user did not respond within Xm]" so it can adapt
-        # rather than pinning the running-agent guard forever.  CLI clarify
-        # blocks indefinitely (input() is synchronous) and ignores this.
+        # a clarify-tool response from the user. Hit this and the agent
+        # unblocks with "[user did not respond within Xm]" so it can adapt.
+        # Exactly 0 disables automatic expiry; explicit session interruption
+        # or teardown still releases the wait. CLI uses clarify.timeout,
+        # while messaging/TUI surfaces use this agent.clarify_timeout value.
         # Default 3600 (1h): real users step away (meetings, AFK) and the
         # old 600s default evicted the entry mid-think, so a later button
         # tap landed on a dead entry (#32762).  Tradeoff: a higher value
         # holds the gateway's running-agent guard longer for a genuinely
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
+        # Clarify prompts sent through messaging/TUI surfaces.  0 waits until
+        # the user answers or explicitly interrupts the session.
         "clarify_timeout": 3600,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
@@ -2516,9 +2519,16 @@ DEFAULT_CONFIG = {
     # cron_mode — what to do when a cron job hits a dangerous command:
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
+    # Human-response waits. Exactly 0 opts in to waiting until the user answers
+    # or interrupts; positive values retain fail-closed expiry. Invalid,
+    # negative, and non-finite values fall back to these finite defaults.
+    "clarify": {
+        "timeout": 120,  # CLI clarify prompts
+    },
     "approvals": {
         "mode": "manual",
-        "timeout": 60,
+        "timeout": 60,          # CLI and ACP approvals
+        "gateway_timeout": 300, # Messaging, TUI gateway and API/WebUI approvals
         "cron_mode": "deny",
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the

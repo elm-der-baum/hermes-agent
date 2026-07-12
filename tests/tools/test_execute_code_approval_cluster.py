@@ -232,10 +232,10 @@ def test_guard_gateway_user_denies_blocks(gw_session):
 
 
 def test_guard_gateway_timeout_blocks(gw_session, monkeypatch):
-    # Register a callback that never resolves; force an immediate timeout.
+    # Register a callback that never resolves; force a short finite timeout.
     with A._lock:
         A._gateway_notify_cbs[gw_session] = lambda _d: None
-    monkeypatch.setattr(A, "_get_approval_config", lambda: {"gateway_timeout": 0})
+    monkeypatch.setattr(A, "_get_approval_config", lambda: {"gateway_timeout": 0.01})
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["outcome"] == "timeout"

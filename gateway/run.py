@@ -353,6 +353,13 @@ def _redact_approval_command(cmd: "str | None") -> str:
     return redact_sensitive_text(str(cmd or ""), force=True)
 
 
+def _require_send_success(result, label: str) -> None:
+    """Raise when a human-response prompt was not actually delivered."""
+    if result is None or not bool(getattr(result, "success", False)):
+        error = getattr(result, "error", None) if result is not None else None
+        raise RuntimeError(f"{label} delivery failed: {error or 'no send result'}")
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -15961,12 +15968,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         try:
-            from tools.approval import clear_session as _clear_approval_session
+            from tools.approval import close_session as _close_approval_session
         except Exception:
             return
 
         try:
-            _clear_approval_session(session_key)
+            _close_approval_session(session_key)
         except Exception as e:
             logger.debug(
                 "Failed to clear approval state for session boundary %s: %s",
@@ -16042,6 +16049,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
+        # Human-response waits can be intentionally unlimited. Release both
+        # registries at the session boundary so /stop and /new never leave the
+        # old agent thread parked behind a stale prompt.
+        try:
+            from tools.approval import close_session as close_approval_session
+            from tools.clarify_gateway import close_session as close_clarify_session
+
+            close_clarify_session(session_key)
+            close_approval_session(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to clear pending human-response prompts for %s",
+                session_key,
+                exc_info=True,
+            )
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         if adapter and hasattr(adapter, "interrupt_session_activity"):
@@ -18339,9 +18361,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # callback contract).  Bridges sync→async by scheduling the
             # adapter's send_clarify on the gateway event loop, then blocks on
             # the clarify primitive's threading.Event with a configurable
-            # timeout.  Returns the user's response string, or a sentinel
-            # explaining that no response arrived (so the agent can adapt
-            # rather than hang forever).
+            # timeout. A timeout of zero waits until the user responds or the
+            # session is explicitly interrupted.
             # ------------------------------------------------------------------
             def _clarify_callback_sync(question: str, choices) -> str:
                 from tools import clarify_gateway as _clarify_mod
@@ -18400,9 +18421,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 timeout = _clarify_mod.get_clarify_timeout()
                 response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
-                if response is None or response == "":
-                    # Timeout or session-boundary cancellation
+                if response is None:
+                    if timeout <= 0:
+                        return "[clarify prompt ended without a response]"
                     return f"[user did not respond within {int(timeout / 60)}m]"
+                if response == "":
+                    return "[clarify prompt cancelled by session boundary]"
                 return response
 
             agent.clarify_callback = _clarify_callback_sync
@@ -18563,10 +18587,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger=logger,
                         log_message="Approval text-send scheduling error",
                     )
-                    if _approval_send_fut is not None:
-                        _approval_send_fut.result(timeout=15)
+                    if _approval_send_fut is None:
+                        raise RuntimeError("approval text send: loop unavailable")
+                    _approval_send_result = _approval_send_fut.result(timeout=15)
+                    _require_send_success(
+                        _approval_send_result,
+                        "approval text prompt",
+                    )
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
+                    raise RuntimeError("approval prompt delivery failed") from _e
 
             # Keep real user text separate from API-only recovery guidance.  If
             # an auto-continue note is prepended below, persist the original
@@ -18793,8 +18823,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
                 try:
-                    from tools.clarify_gateway import clear_session as _clear_clarify_session
-                    _clear_clarify_session(_approval_session_key)
+                    from tools.clarify_gateway import close_session as _close_clarify_session
+                    _close_clarify_session(_approval_session_key)
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)

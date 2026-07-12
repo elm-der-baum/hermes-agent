@@ -355,6 +355,16 @@ class TestPostStopInterruptSwallow:
         runner.adapters = {}
         runner._pending_messages = {}
 
+        from tools import approval as approval_mod
+        from tools import clarify_gateway as clarify_mod
+
+        clarify_mod.register("pending-clarify", session_key, "Continue?", None)
+        approval_entry = approval_mod._ApprovalEntry(
+            {"command": "danger", "description": "test"}
+        )
+        with approval_mod._lock:
+            approval_mod._gateway_queues[session_key] = [approval_entry]
+
         invalidated = []
         runner._invalidate_session_run_generation = (
             lambda key, reason=None: invalidated.append((key, reason))
@@ -373,6 +383,22 @@ class TestPostStopInterruptSwallow:
 
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
         assert released == [session_key]
+        assert clarify_mod.get_pending_for_session(session_key) is None
+        assert approval_entry.event.is_set()
+        assert approval_entry.result == "deny"
+
+        late_clarify = clarify_mod.register(
+            "late-clarify", session_key, "Too late?", None
+        )
+        assert late_clarify.event.is_set()
+        assert clarify_mod.get_pending_for_session(session_key) is None
+        assert approval_mod._await_gateway_decision(
+            session_key,
+            lambda _data: None,
+            {"command": "danger", "description": "late"},
+            timeout_seconds=0,
+        ) == {"resolved": False, "choice": None, "notify_failed": True}
+
         assert session_key not in runner._agent_cache, (
             "Cached agent with a set interrupt flag must be evicted on /stop "
             "so the flag cannot kill the session's next message (#44212)"

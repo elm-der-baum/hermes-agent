@@ -2054,6 +2054,36 @@ class TestEtcPatternsUnaffectedByRefactor:
 # =========================================================================
 
 
+class TestElicitationTimeoutPropagation:
+    def test_gateway_wait_receives_explicit_timeout(self, monkeypatch):
+        from tools import approval as mod
+
+        session_key = "gateway:telegram:chat"
+        monkeypatch.setattr(mod, "get_current_session_key", lambda: session_key)
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: True)
+        with mod._lock:
+            mod._gateway_notify_cbs[session_key] = lambda _data: None
+        seen = {}
+
+        def fake_await(*_args, **kwargs):
+            seen.update(kwargs)
+            return {"resolved": True, "choice": "once"}
+
+        monkeypatch.setattr(mod, "_await_gateway_decision", fake_await)
+        try:
+            result = mod.request_elicitation_consent(
+                "Continue?",
+                "MCP request",
+                timeout_seconds=0,
+            )
+        finally:
+            with mod._lock:
+                mod._gateway_notify_cbs.pop(session_key, None)
+
+        assert result == "accept"
+        assert seen["timeout_seconds"] == 0
+
+
 class TestApprovalTimeoutIsNotConsent:
     """The gateway approval contract: silence is not consent (#24912)."""
 
@@ -2064,6 +2094,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        getattr(mod, "_closed_gateway_sessions", set()).clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
@@ -2087,6 +2118,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        getattr(mod, "_closed_gateway_sessions", set()).clear()
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -2099,6 +2131,116 @@ class TestApprovalTimeoutIsNotConsent:
             mod, "_get_approval_config",
             lambda: {"mode": "manual", "gateway_timeout": seconds, "timeout": seconds},
         )
+
+    def test_local_timeout_preserves_fraction_and_rejects_non_finite(self, monkeypatch):
+        from tools import approval as mod
+
+        monkeypatch.setattr(mod, "_get_approval_config", lambda: {"timeout": 0.5})
+        assert mod._get_approval_timeout() == 0.5
+
+        monkeypatch.setattr(
+            mod, "_get_approval_config", lambda: {"timeout": float("inf")}
+        )
+        assert mod._get_approval_timeout() == 60
+
+    def test_unregistered_session_rejects_captured_notify_without_queueing(self):
+        from tools import approval as mod
+
+        session_key = "closed-captured-notify"
+        mod.register_gateway_notify(session_key, lambda _data: None)
+        captured = mod._gateway_notify_cbs[session_key]
+        mod.unregister_gateway_notify(session_key)
+
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                mod._await_gateway_decision(
+                    session_key,
+                    captured,
+                    {"command": "danger", "description": "test"},
+                    timeout_seconds=0,
+                )
+            ),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.2)
+        was_alive = thread.is_alive()
+        mod.resolve_gateway_approval(session_key, "deny")
+        thread.join(timeout=1)
+
+        assert not was_alive, "late approval registration blocked after unregister"
+        assert result == [{
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+        }]
+        assert mod._gateway_queues.get(session_key) is None
+
+    def test_closed_session_rejects_captured_notify_without_queueing(self):
+        from tools import approval as mod
+
+        session_key = "cleared-captured-notify"
+        mod.register_gateway_notify(session_key, lambda _data: None)
+        captured = mod._gateway_notify_cbs[session_key]
+        mod.close_session(session_key)
+
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                mod._await_gateway_decision(
+                    session_key,
+                    captured,
+                    {"command": "danger", "description": "test"},
+                    timeout_seconds=0,
+                )
+            ),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.2)
+        was_alive = thread.is_alive()
+        mod.unregister_gateway_notify(session_key)
+        thread.join(timeout=1)
+
+        assert was_alive is False
+        assert result == [{
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+        }]
+        assert mod._gateway_queues.get(session_key) is None
+
+    def test_zero_gateway_timeout_waits_for_explicit_decision(self, monkeypatch):
+        """gateway_timeout=0 means unlimited while still requiring real consent."""
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch, seconds=0)
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+
+        result_holder = {}
+
+        def _check():
+            result_holder["r"] = mod.check_all_command_guards("rm -rf .git", "local")
+
+        thread = threading.Thread(target=_check, daemon=True)
+        thread.start()
+
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.01)
+
+        time.sleep(0.05)
+        assert thread.is_alive(), "unlimited approval expired before the user answered"
+
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert result_holder["r"]["approved"] is True
+        assert result_holder["r"]["user_approved"] is True
+        assert result_holder["r"]["message"] is None
 
     def test_timeout_returns_approved_false_with_no_consent(self, monkeypatch):
         """The reported #24912 scenario — user never responds, agent must see BLOCKED."""

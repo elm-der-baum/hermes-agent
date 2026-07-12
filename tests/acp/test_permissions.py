@@ -2,7 +2,8 @@
 
 import asyncio
 import inspect
-from concurrent.futures import Future
+import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from acp.schema import (
@@ -143,6 +144,95 @@ class TestApprovalBridge:
 
         assert denied_result == "deny"
         assert unknown_result == "deny"
+
+    def test_zero_timeout_waits_without_deadline(self):
+        result, _, _, future, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            timeout=0,
+        )
+
+        assert result == "once"
+        future.result.assert_called_once_with(timeout=0.25)
+
+    def test_interrupt_releases_unlimited_wait(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = MagicMock(spec=Future)
+        future.result.side_effect = FutureTimeout()
+        scheduled = {}
+
+        def _schedule(coro, passed_loop):
+            scheduled["coro"] = coro
+            scheduled["loop"] = passed_loop
+            return future
+
+        with patch(
+            "agent.async_utils.asyncio.run_coroutine_threadsafe",
+            side_effect=_schedule,
+        ), patch("tools.interrupt.is_interrupted", return_value=True):
+            cb = make_approval_callback(
+                request_permission, loop, session_id="s1", timeout=0
+            )
+            result = cb("rm -rf /", "dangerous command")
+
+        scheduled["coro"].close()
+        assert result == "deny"
+        future.result.assert_not_called()
+        future.cancel.assert_called_once()
+
+    def test_completed_future_timeout_error_fails_closed_without_spinning(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = Future()
+        future.set_exception(FutureTimeout("ACP operation failed"))
+
+        interrupted = threading.Event()
+        with patch(
+            "agent.async_utils.asyncio.run_coroutine_threadsafe",
+            return_value=future,
+        ) as schedule, patch(
+            "tools.interrupt.is_interrupted", side_effect=interrupted.is_set
+        ):
+            cb = make_approval_callback(
+                request_permission, loop, session_id="s1", timeout=0
+            )
+            result = []
+            thread = threading.Thread(
+                target=lambda: result.append(cb("rm -rf /", "dangerous command")),
+                daemon=True,
+            )
+            thread.start()
+            thread.join(timeout=0.2)
+            was_alive = thread.is_alive()
+            interrupted.set()
+            thread.join(timeout=1)
+
+        schedule.call_args.args[0].close()
+        assert not was_alive, "completed TimeoutError future caused a busy loop"
+        assert result == ["deny"]
+
+    def test_default_timeout_uses_global_unlimited_config(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = MagicMock(spec=Future)
+        future.result.return_value = _make_response(
+            AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+        scheduled = {}
+
+        def _schedule(coro, passed_loop):
+            scheduled["coro"] = coro
+            scheduled["loop"] = passed_loop
+            return future
+
+        with patch("hermes_cli.config.load_config", return_value={"approvals": {"timeout": 0}}), \
+             patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=_schedule):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            result = cb("rm -rf /", "dangerous command")
+
+        scheduled["coro"].close()
+        assert result == "once"
+        future.result.assert_called_once_with(timeout=0.25)
 
     def test_timeout_returns_deny_and_cancels_future(self):
         loop = MagicMock(spec=asyncio.AbstractEventLoop)

@@ -21,6 +21,7 @@ def _clear_clarify_state():
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+        getattr(cm, "_closed_sessions", set()).clear()
 
 
 class TestClarifyPrimitive:
@@ -118,6 +119,41 @@ class TestClarifyPrimitive:
         result = cm.wait_for_response("id5", timeout=0.2)
         assert result is None
 
+    def test_zero_timeout_waits_until_response(self):
+        """A configured timeout of zero means unlimited, not immediate expiry."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id5-unlimited", "sk5-unlimited", "Q?", ["A"])
+
+        def resolver():
+            time.sleep(0.05)
+            cm.resolve_gateway_clarify("id5-unlimited", "A")
+
+        threading.Thread(target=resolver, daemon=True).start()
+        result = cm.wait_for_response("id5-unlimited", timeout=0)
+
+        assert result == "A"
+
+    def test_zero_timeout_is_released_by_interrupt(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        cm.register("interrupt-me", "session-1", "Continue?", None)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: True)
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(cm.wait_for_response("interrupt-me", timeout=0)),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=1.5)
+        was_alive = thread.is_alive()
+        if was_alive:
+            cm.clear_session("session-1")
+            thread.join(timeout=1)
+
+        assert not was_alive, "interrupt did not release unlimited clarify wait"
+        assert result == [""]
+
     def test_resolve_unknown_id_returns_false(self):
         """resolve_gateway_clarify is idempotent on unknown ids."""
         from tools import clarify_gateway as cm
@@ -193,14 +229,72 @@ class TestClarifyPrimitive:
         assert b is not None and b.clarify_id == "idB"
 
     def test_clarify_timeout_config_default(self):
-        """get_clarify_timeout returns a positive int (default 3600)."""
+        """get_clarify_timeout returns seconds; zero is unlimited."""
         from tools import clarify_gateway as cm
 
         timeout = cm.get_clarify_timeout()
-        # Default 3600s OR whatever is in the user's loaded config.
-        # Floor check: must be a positive int, not crashed.
-        assert isinstance(timeout, int)
-        assert timeout > 0
+        # Default 3600s OR the user's configured value (including 0).
+        assert isinstance(timeout, (int, float))
+        assert timeout >= 0
+
+    def test_clarify_timeout_preserves_positive_fraction_and_rejects_non_finite(self, monkeypatch):
+        from tools import clarify_gateway as cm
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"clarify_timeout": 0.5}},
+        )
+        assert cm.get_clarify_timeout() == 0.5
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"clarify_timeout": float("inf")}},
+        )
+        assert cm.get_clarify_timeout() == 3600
+
+    def test_unregister_prevents_late_registration_from_blocking(self):
+        from tools import clarify_gateway as cm
+
+        cm.register_notify("closed-session", lambda _entry: None)
+        cm.unregister_notify("closed-session")
+        cm.register("late", "closed-session", "Q?", None)
+
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(cm.wait_for_response("late", timeout=0)),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.2)
+        was_alive = thread.is_alive()
+        cm.clear_session("closed-session")
+        thread.join(timeout=1)
+
+        assert was_alive is False
+        assert result == [None]
+
+    def test_close_session_prevents_late_registration_from_blocking(self):
+        from tools import clarify_gateway as cm
+
+        cm.register_notify("cleared-session", lambda _entry: None)
+        cm.close_session("cleared-session")
+        cm.register("late-clear", "cleared-session", "Q?", None)
+
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                cm.wait_for_response("late-clear", timeout=0)
+            ),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.2)
+        was_alive = thread.is_alive()
+        cm.unregister_notify("cleared-session")
+        thread.join(timeout=1)
+
+        assert was_alive is False
+        assert result == [None]
 
 
 class TestGatewayTextIntercept:

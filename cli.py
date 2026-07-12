@@ -11571,12 +11571,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         Sets up the interactive selection UI (or freetext prompt for open-ended
         questions), then blocks until the user responds via the prompt_toolkit
-        key bindings.  If no response arrives within the configured timeout the
-        question is dismissed and the agent is told to decide on its own.
+        key bindings. A positive configured timeout dismisses an unanswered
+        question; ``clarify.timeout: 0`` waits until the user responds or the
+        session is explicitly interrupted.
         """
         import time as _time
 
-        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+        from hermes_cli.human_wait import normalize_human_timeout
+
+        timeout = normalize_human_timeout(
+            CLI_CONFIG.get("clarify", {}).get("timeout", 120),
+            default=120,
+        )
+        unlimited = timeout == 0
         response_queue = queue.Queue()
         is_open_ended = not choices
 
@@ -11586,7 +11593,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "selected": 0,
             "response_queue": response_queue,
         }
-        self._clarify_deadline = _time.monotonic() + timeout
+        self._clarify_deadline = 0 if unlimited else _time.monotonic() + timeout
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
 
@@ -11607,9 +11614,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._persist_prompt_summary("?", "Clarify", question, str(result))
                 return result
             except queue.Empty:
-                remaining = self._clarify_deadline - _time.monotonic()
-                if remaining <= 0:
-                    break
+                if not unlimited:
+                    remaining = self._clarify_deadline - _time.monotonic()
+                    if remaining <= 0:
+                        break
                 now = _time.monotonic()
                 if now - _last_countdown_refresh >= 1.0:
                     _last_countdown_refresh = now
@@ -11688,11 +11696,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         Uses _approval_lock to serialize concurrent requests (e.g. from
         parallel delegation subtasks) so each prompt gets its own turn
         and the shared _approval_state / _approval_deadline aren't clobbered.
+        ``approvals.timeout: 0`` waits until the user decides or interrupts.
         """
         import time as _time
 
         with self._approval_lock:
-            timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 60))
+            from hermes_cli.human_wait import normalize_human_timeout
+
+            timeout = normalize_human_timeout(
+                CLI_CONFIG.get("approvals", {}).get("timeout", 60),
+                default=60,
+            )
+            unlimited = timeout == 0
             response_queue = queue.Queue()
 
             self._approval_state = {
@@ -11702,7 +11717,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 "selected": 0,
                 "response_queue": response_queue,
             }
-            self._approval_deadline = _time.monotonic() + timeout
+            self._approval_deadline = 0 if unlimited else _time.monotonic() + timeout
 
             # Modal prompt — paint immediately, bypassing the throttle/resize
             # guard. A throttled paint here can be silently dropped (250ms
@@ -11730,9 +11745,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     )
                     return result
                 except queue.Empty:
-                    remaining = self._approval_deadline - _time.monotonic()
-                    if remaining <= 0:
-                        break
+                    if not unlimited:
+                        remaining = self._approval_deadline - _time.monotonic()
+                        if remaining <= 0:
+                            break
                     now = _time.monotonic()
                     if now - _last_countdown_refresh >= 1.0:
                         _last_countdown_refresh = now
@@ -14408,10 +14424,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 ]
 
             if cli_ref._approval_state:
-                remaining = max(0, int(cli_ref._approval_deadline - time.monotonic()))
+                countdown = '  (no timeout)'
+                if cli_ref._approval_deadline:
+                    remaining = max(0, int(cli_ref._approval_deadline - time.monotonic()))
+                    countdown = f'  ({remaining}s)'
                 return [
                     ('class:hint', '  ↑/↓ to select, Enter to confirm'),
-                    ('class:clarify-countdown', f'  ({remaining}s)'),
+                    ('class:clarify-countdown', countdown),
                 ]
 
             if cli_ref._slash_confirm_state:
@@ -14422,8 +14441,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 ]
 
             if cli_ref._clarify_state:
-                remaining = max(0, int(cli_ref._clarify_deadline - time.monotonic()))
-                countdown = f'  ({remaining}s)' if cli_ref._clarify_deadline else ''
+                countdown = '  (no timeout)'
+                if cli_ref._clarify_deadline:
+                    remaining = max(0, int(cli_ref._clarify_deadline - time.monotonic()))
+                    countdown = f'  ({remaining}s)'
                 if cli_ref._clarify_freetext:
                     return [
                         ('class:hint', '  type your answer and press Enter'),

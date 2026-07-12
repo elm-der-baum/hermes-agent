@@ -8,6 +8,20 @@ import cli as cli_module
 from cli import HermesCLI
 
 
+class _OneEmptyThen:
+    """Queue stub that proves a zero-timeout callback survives one poll cycle."""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def get(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise queue.Empty
+        return self.value
+
+
 class _FakeBuffer:
     def __init__(self, text="", cursor_position=None):
         self.text = text
@@ -67,6 +81,33 @@ def _make_background_cli_stub():
 
 
 class TestCliApprovalUi:
+    def test_zero_clarify_timeout_waits_for_response(self):
+        cli = _make_cli_stub()
+        cli._clarify_state = None
+        cli._clarify_freetext = False
+        cli._clarify_deadline = 0
+        response_queue = _OneEmptyThen("B")
+
+        with patch.dict(cli_module.CLI_CONFIG, {"clarify": {"timeout": 0}}), \
+             patch.object(cli_module.queue, "Queue", return_value=response_queue), \
+             patch.object(cli_module, "_cprint"):
+            result = cli._clarify_callback("Pick one", ["A", "B"])
+
+        assert result == "B"
+        assert response_queue.calls == 2
+
+    def test_zero_approval_timeout_waits_for_response(self):
+        cli = _make_cli_stub()
+        response_queue = _OneEmptyThen("once")
+
+        with patch.dict(cli_module.CLI_CONFIG, {"approvals": {"timeout": 0}}), \
+             patch.object(cli_module.queue, "Queue", return_value=response_queue), \
+             patch.object(cli_module, "_cprint"):
+            result = cli._approval_callback("rm -rf /tmp/example", "danger")
+
+        assert result == "once"
+        assert response_queue.calls == 2
+
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()
         cli._app.current_buffer = _FakeBuffer("draft command", cursor_position=5)

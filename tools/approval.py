@@ -1436,6 +1436,7 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_closed_gateway_sessions: set[str] = set()
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -1447,6 +1448,7 @@ def register_gateway_notify(session_key: str, cb) -> None:
     thread, must schedule the actual send on the event loop).
     """
     with _lock:
+        _closed_gateway_sessions.discard(session_key)
         _gateway_notify_cbs[session_key] = cb
 
 
@@ -1457,6 +1459,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     (e.g. when the agent run finishes or is interrupted).
     """
     with _lock:
+        _closed_gateway_sessions.add(session_key)
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
@@ -1562,6 +1565,22 @@ def clear_session(session_key: str) -> None:
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
+        entry.result = "deny"
+        entry.event.set()
+
+
+def close_session(session_key: str) -> None:
+    """Close a session atomically and deny all pending approval waits."""
+    if not session_key:
+        return
+    with _lock:
+        _closed_gateway_sessions.add(session_key)
+        _gateway_notify_cbs.pop(session_key, None)
+        _session_approved.pop(session_key, None)
+        _session_yolo.discard(session_key)
+        _pending.pop(session_key, None)
+        entries = _gateway_queues.pop(session_key, [])
+    for entry in entries:
         entry.result = "deny"
         entry.event.set()
 
@@ -1681,7 +1700,7 @@ def save_permanent_allowlist(patterns: set):
 # =========================================================================
 
 def prompt_dangerous_approval(command: str, description: str,
-                              timeout_seconds: int | None = None,
+                              timeout_seconds: float | None = None,
                               allow_permanent: bool = True,
                               approval_callback=None) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
@@ -1768,9 +1787,11 @@ def prompt_dangerous_approval(command: str, description: str,
                 except (EOFError, OSError):
                     result["choice"] = ""
 
+            from hermes_cli.human_wait import wait_timeout
+
             thread = threading.Thread(target=get_input, daemon=True)
             thread.start()
-            thread.join(timeout=timeout_seconds)
+            thread.join(timeout=wait_timeout(timeout_seconds, default=60))
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
@@ -1871,12 +1892,13 @@ def is_approval_bypass_active() -> bool:
     )
 
 
-def _get_approval_timeout() -> int:
-    """Read the approval timeout from config. Defaults to 60 seconds."""
-    try:
-        return int(_get_approval_config().get("timeout", 60))
-    except (ValueError, TypeError):
-        return 60
+def _get_approval_timeout() -> float:
+    """Read and safely normalize the local approval timeout."""
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    return normalize_human_timeout(
+        _get_approval_config().get("timeout", 60), default=60
+    )
 
 
 def _get_cron_approval_mode() -> str:
@@ -2436,11 +2458,19 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
-def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+def _await_gateway_decision(
+    session_key: str,
+    notify_cb,
+    approval_data: dict,
+    *,
+    surface: str = "gateway",
+    timeout_seconds: float | None = None,
+) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
-    thread until the request is resolved or the gateway approval timeout
-    elapses — firing pre/post approval hooks and cleaning up the queue entry.
+    thread until the request is resolved or its configured timeout expires.
+
+    ``timeout_seconds`` overrides the global gateway value for callers such as
+    MCP elicitation. Exactly zero means no deadline; interrupts remain active.
 
     Shared by the terminal command guard (``check_all_command_guards``) and
     the execute_code guard (``check_execute_code_guard``) so the fiddly
@@ -2458,6 +2488,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     entry = _ApprovalEntry(approval_data)
     with _lock:
+        if session_key in _closed_gateway_sessions:
+            return {"resolved": False, "choice": None, "notify_failed": True}
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
@@ -2489,15 +2521,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         _drop_entry()
         return {"resolved": False, "choice": None, "notify_failed": True}
 
-    # Block until the user responds or timeout (default 5 min). Poll in short
-    # slices so we can fire activity heartbeats every ~10s to the agent's
-    # inactivity tracker — otherwise the gateway watchdog kills the agent
-    # while the user is still responding. Mirrors _wait_for_process() cadence.
-    timeout = _get_approval_config().get("gateway_timeout", 300)
-    try:
-        timeout = int(timeout)
-    except (ValueError, TypeError):
-        timeout = 300
+    # Block until the user responds or a finite timeout expires.  A configured
+    # timeout == 0 means unlimited, but polling continues so interrupts and
+    # activity heartbeats remain effective.
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    raw_timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else _get_approval_config().get("gateway_timeout", 300)
+    )
+    timeout = normalize_human_timeout(raw_timeout, default=300)
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -2505,17 +2539,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    _deadline = None if timeout == 0 else _now + timeout
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
         # Respect interrupt signals (e.g. /stop, /new, or an inactivity
-        # timeout from the gateway) so a pending approval doesn't keep the
-        # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
-        # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
-        # normal denial and unwinds cleanly (#8697).
+        # timeout from the gateway) so a pending approval never wedges the
+        # session after the user explicitly cancels the turn.
         if is_interrupted():
             logger.info(
                 "Approval wait interrupted by user signal — "
@@ -2526,10 +2556,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             entry.event.set()
             resolved = True
             break
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
+        _remaining = None if _deadline is None else _deadline - time.monotonic()
+        if _remaining is not None and _remaining <= 0:
             break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
+        _wait_slice = 1.0 if _remaining is None else min(1.0, _remaining)
+        if entry.event.wait(timeout=_wait_slice):
             resolved = True
             break
         if touch_activity_if_due is not None:
@@ -3181,7 +3212,7 @@ def request_elicitation_consent(
     message: str,
     description: str,
     *,
-    timeout_seconds: int | None = None,
+    timeout_seconds: float | None = None,
     surface: str = "mcp-elicitation",
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
@@ -3223,7 +3254,11 @@ def request_elicitation_consent(
         }
         try:
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface=surface,
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                timeout_seconds=timeout_seconds,
             )
         except Exception as exc:
             logger.error(

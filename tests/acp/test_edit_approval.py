@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
+import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from acp_adapter.edit_approval import (
     EditProposal,
     build_acp_edit_tool_call,
     clear_edit_approval_requester,
+    make_acp_edit_approval_requester,
     set_edit_approval_requester,
     should_auto_approve_edit,
 )
@@ -39,6 +45,115 @@ def test_acp_permission_tool_call_uses_edit_kind_and_diff_content():
     assert diff.path == "demo.txt"
     assert diff.oldText == "old\n"
     assert diff.newText == "new\n"
+
+
+def test_edit_approval_uses_global_unlimited_timeout():
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    request_permission = AsyncMock(name="request_permission")
+    future = MagicMock()
+    future.result.return_value = SimpleNamespace(
+        outcome=SimpleNamespace(outcome="selected", option_id="allow_once")
+    )
+
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"approvals": {"timeout": 0}},
+    ), patch(
+        "agent.async_utils.safe_schedule_threadsafe",
+        return_value=future,
+    ) as schedule:
+        requester = make_acp_edit_approval_requester(
+            request_permission,
+            loop,
+            "session-1",
+        )
+        approved = requester(
+            EditProposal(
+                tool_name="write_file",
+                path="demo.txt",
+                old_text="old\n",
+                new_text="new\n",
+                arguments={},
+            )
+        )
+
+    assert approved is True
+    future.result.assert_called_once_with(timeout=0.25)
+    schedule.call_args.args[0].close()
+
+
+def test_interrupt_releases_unlimited_edit_approval():
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    request_permission = AsyncMock(name="request_permission")
+    future = MagicMock(spec=Future)
+    future.result.side_effect = FutureTimeout()
+
+    with patch(
+        "agent.async_utils.safe_schedule_threadsafe",
+        return_value=future,
+    ) as schedule, patch("tools.interrupt.is_interrupted", return_value=True):
+        requester = make_acp_edit_approval_requester(
+            request_permission,
+            loop,
+            "session-1",
+            timeout=0,
+        )
+        approved = requester(
+            EditProposal(
+                tool_name="write_file",
+                path="demo.txt",
+                old_text="old\n",
+                new_text="new\n",
+                arguments={},
+            )
+        )
+
+    schedule.call_args.args[0].close()
+    assert approved is False
+    future.result.assert_not_called()
+    future.cancel.assert_called_once()
+
+
+def test_completed_edit_future_timeout_error_fails_closed_without_spinning():
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    request_permission = AsyncMock(name="request_permission")
+    future = Future()
+    future.set_exception(FutureTimeout("ACP edit operation failed"))
+    interrupted = threading.Event()
+
+    with patch(
+        "agent.async_utils.safe_schedule_threadsafe",
+        return_value=future,
+    ) as schedule, patch(
+        "tools.interrupt.is_interrupted", side_effect=interrupted.is_set
+    ):
+        requester = make_acp_edit_approval_requester(
+            request_permission, loop, "session-1", timeout=0
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                requester(
+                    EditProposal(
+                        tool_name="write_file",
+                        path="demo.txt",
+                        old_text="old\n",
+                        new_text="new\n",
+                        arguments={},
+                    )
+                )
+            ),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.2)
+        was_alive = thread.is_alive()
+        interrupted.set()
+        thread.join(timeout=1)
+
+    schedule.call_args.args[0].close()
+    assert not was_alive, "completed TimeoutError future caused a busy loop"
+    assert result == [False]
 
 
 def test_write_file_rejection_does_not_mutate_existing_file(tmp_path):

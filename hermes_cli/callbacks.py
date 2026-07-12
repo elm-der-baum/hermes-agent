@@ -22,8 +22,13 @@ def clarify_callback(cli, question, choices):
     responds. Returns the user's choice or a timeout message.
     """
     from cli import CLI_CONFIG
+    from hermes_cli.human_wait import normalize_human_timeout
 
-    timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+    timeout = normalize_human_timeout(
+        CLI_CONFIG.get("clarify", {}).get("timeout", 120),
+        default=120,
+    )
+    unlimited = timeout == 0
     response_queue = queue.Queue()
     is_open_ended = not choices
 
@@ -33,7 +38,7 @@ def clarify_callback(cli, question, choices):
         "selected": 0,
         "response_queue": response_queue,
     }
-    cli._clarify_deadline = _time.monotonic() + timeout
+    cli._clarify_deadline = 0 if unlimited else _time.monotonic() + timeout
     cli._clarify_freetext = is_open_ended
 
     if hasattr(cli, "_app") and cli._app:
@@ -45,9 +50,10 @@ def clarify_callback(cli, question, choices):
             cli._clarify_deadline = 0
             return result
         except queue.Empty:
-            remaining = cli._clarify_deadline - _time.monotonic()
-            if remaining <= 0:
-                break
+            if not unlimited:
+                remaining = cli._clarify_deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
             if hasattr(cli, "_app") and cli._app:
                 cli._app.invalidate()
 
@@ -201,7 +207,13 @@ def approval_callback(cli, command: str, description: str) -> str:
 
     with lock:
         from cli import CLI_CONFIG
-        timeout = CLI_CONFIG.get("approvals", {}).get("timeout", 60)
+        from hermes_cli.human_wait import normalize_human_timeout
+
+        timeout = normalize_human_timeout(
+            CLI_CONFIG.get("approvals", {}).get("timeout", 60),
+            default=60,
+        )
+        unlimited = timeout == 0
         response_queue = queue.Queue()
         choices = ["once", "session", "always", "deny"]
         if len(command) > 70:
@@ -214,7 +226,7 @@ def approval_callback(cli, command: str, description: str) -> str:
             "selected": 0,
             "response_queue": response_queue,
         }
-        cli._approval_deadline = _time.monotonic() + timeout
+        cli._approval_deadline = 0 if unlimited else _time.monotonic() + timeout
 
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
@@ -228,9 +240,10 @@ def approval_callback(cli, command: str, description: str) -> str:
                     cli._app.invalidate()
                 return result
             except queue.Empty:
-                remaining = cli._approval_deadline - _time.monotonic()
-                if remaining <= 0:
-                    break
+                if not unlimited:
+                    remaining = cli._approval_deadline - _time.monotonic()
+                    if remaining <= 0:
+                        break
                 if hasattr(cli, "_app") and cli._app:
                     cli._app.invalidate()
 

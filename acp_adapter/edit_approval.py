@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import tempfile
+import time
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -287,10 +288,26 @@ def make_acp_edit_approval_requester(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float | None = None,
     auto_approve_getter: Callable[[], tuple[str, str | None]] | None = None,
 ) -> EditApprovalRequester:
-    """Return a sync requester that bridges edit proposals to ACP permissions."""
+    """Return a sync requester that bridges edit proposals to ACP permissions.
+
+    ``timeout=None`` reads global ``approvals.timeout`` and zero means no
+    automatic expiry.
+    """
+    raw_timeout: object = timeout
+    if raw_timeout is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            raw_timeout = (cfg.get("approvals", {}) or {}).get("timeout", 60)
+        except Exception:
+            raw_timeout = 60
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    parsed_timeout = normalize_human_timeout(raw_timeout, default=60)
 
     def _requester(proposal: EditProposal) -> bool:
         from acp.schema import PermissionOption
@@ -323,11 +340,36 @@ def make_acp_edit_approval_requester(
         )
         if future is None:
             return False
+        deadline = (
+            None if parsed_timeout == 0 else time.monotonic() + parsed_timeout
+        )
         try:
-            response = future.result(timeout=timeout)
-        except (FutureTimeout, Exception) as exc:
+            from tools.interrupt import is_interrupted
+
+            while True:
+                if is_interrupted():
+                    future.cancel()
+                    return False
+                remaining = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
+                    raise FutureTimeout()
+                poll_timeout = 0.25 if remaining is None else min(0.25, remaining)
+                try:
+                    response = future.result(timeout=poll_timeout)
+                    break
+                except FutureTimeout:
+                    if future.done():
+                        raise
+                    continue
+        except FutureTimeout as exc:
             future.cancel()
-            logger.warning("Edit approval request timed out or failed: %s", exc)
+            logger.warning("Edit approval request timed out: %s", exc)
+            return False
+        except Exception as exc:
+            future.cancel()
+            logger.warning("Edit approval request failed: %s", exc)
             return False
         outcome = getattr(response, "outcome", None)
         return (

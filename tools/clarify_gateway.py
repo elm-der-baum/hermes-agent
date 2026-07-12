@@ -10,8 +10,7 @@ that:
   * blocks the agent thread on an ``Event``,
   * resolves the wait when the gateway's button-callback or text-intercept
     fires ``resolve_gateway_clarify(clarify_id, response)``,
-  * supports timeouts so a user who never responds does NOT hang the agent
-    thread forever (which would also pin the gateway's running-agent guard).
+  * supports finite timeouts and an explicit unlimited-wait mode (timeout 0).
 
 State is module-level (same shape as ``tools.approval``) so platform
 adapters can call ``resolve_gateway_clarify`` without holding a back-
@@ -69,6 +68,7 @@ _lock = threading.RLock()
 _entries: Dict[str, _ClarifyEntry] = {}
 # session_key → list[clarify_id]  (FIFO; for text-fallback intercept and session cleanup)
 _session_index: Dict[str, List[str]] = {}
+_closed_sessions: set[str] = set()
 
 
 # =========================================================================
@@ -95,6 +95,10 @@ def register(
         awaiting_text=not bool(choices),
     )
     with _lock:
+        if session_key in _closed_sessions:
+            entry.response = ""
+            entry.event.set()
+            return entry
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
     return entry
@@ -103,12 +107,11 @@ def register(
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     """Block on the entry's event until resolved or timeout fires.
 
-    Polls in 1-second slices so the agent's inactivity heartbeat keeps
-    firing — without this, ``Event.wait(timeout=600)`` blocks the thread
-    for 10 minutes with zero activity touches and the gateway's inactivity
-    watchdog kills the agent while the user is still typing.
+    ``timeout == 0`` means unlimited.  The wait still polls in 1-second
+    slices so the agent's inactivity heartbeat keeps firing and session
+    interruption/cleanup can release the entry.
 
-    Returns the resolved response string, or ``None`` on timeout.
+    Returns the resolved response string, or ``None`` on a finite timeout.
     """
     with _lock:
         entry = _entries.get(clarify_id)
@@ -119,14 +122,28 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover - optional
         touch_activity_if_due = None
+    try:
+        from tools.interrupt import is_interrupted
+    except Exception:  # pragma: no cover - optional
+        def is_interrupted() -> bool:
+            return False
 
-    deadline = time.monotonic() + max(timeout, 0.0)
-    activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    timeout = normalize_human_timeout(timeout, default=3600)
+    deadline = None if timeout == 0 else time.monotonic() + timeout
+    now = time.monotonic()
+    activity_state = {"last_touch": now, "start": now}
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if is_interrupted():
+            entry.response = ""
+            entry.event.set()
             break
-        if entry.event.wait(timeout=min(1.0, remaining)):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            break
+        wait_slice = 1.0 if remaining is None else min(1.0, remaining)
+        if entry.event.wait(timeout=wait_slice):
             break
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
@@ -258,11 +275,28 @@ def clear_session(session_key: str) -> int:
     return cancelled
 
 
+def close_session(session_key: str) -> int:
+    """Close a session atomically and cancel all pending clarifications."""
+    with _lock:
+        _closed_sessions.add(session_key)
+        _notify_cbs.pop(session_key, None)
+        ids = list(_session_index.pop(session_key, []) or [])
+        entries = [_entries.pop(cid, None) for cid in ids]
+    cancelled = 0
+    for entry in entries:
+        if entry is None:
+            continue
+        entry.response = ""
+        entry.event.set()
+        cancelled += 1
+    return cancelled
+
+
 # =========================================================================
 # Config
 # =========================================================================
 
-def get_clarify_timeout() -> int:
+def get_clarify_timeout() -> float:
     """Read the clarify response timeout (seconds) from config.
 
     Defaults to 3600 (1 hour) — long enough that a user who steps away
@@ -273,15 +307,20 @@ def get_clarify_timeout() -> int:
     tap landed on a dead entry and the agent hung on ``running: clarify``
     (#32762).
 
-    Reads ``agent.clarify_timeout`` from config.yaml.
+    Reads ``agent.clarify_timeout`` from config.yaml.  A value of ``0``
+    explicitly disables automatic expiry; session interrupt/cleanup still
+    releases the pending prompt.
     """
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
         agent_cfg = cfg.get("agent", {}) or {}
-        return int(agent_cfg.get("clarify_timeout", 3600))
+        raw_timeout = agent_cfg.get("clarify_timeout", 3600)
     except Exception:
-        return 3600
+        raw_timeout = 3600
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    return normalize_human_timeout(raw_timeout, default=3600)
 
 
 # =========================================================================
@@ -298,12 +337,14 @@ _notify_cbs: Dict[str, Callable[[_ClarifyEntry], None]] = {}
 def register_notify(session_key: str, cb: Callable[[_ClarifyEntry], None]) -> None:
     """Register a per-session notify callback used by ``clarify_callback``."""
     with _lock:
+        _closed_sessions.discard(session_key)
         _notify_cbs[session_key] = cb
 
 
 def unregister_notify(session_key: str) -> None:
     """Drop the per-session notify callback and cancel any pending clarify entries."""
     with _lock:
+        _closed_sessions.add(session_key)
         _notify_cbs.pop(session_key, None)
     # Cancel any pending entries so blocked threads unwind when the run
     # ends (interrupt, completion, gateway shutdown).

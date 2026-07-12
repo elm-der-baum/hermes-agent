@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from concurrent.futures import TimeoutError as FutureTimeout
 from itertools import count
 from typing import Callable
@@ -108,7 +109,7 @@ def make_approval_callback(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float | None = None,
 ) -> Callable[..., str]:
     """
     Return a Hermes-compatible approval callback that bridges to ACP.
@@ -121,8 +122,21 @@ def make_approval_callback(
         request_permission_fn: The ACP connection's ``request_permission`` coroutine.
         loop: The event loop on which the ACP connection lives.
         session_id: Current ACP session id.
-        timeout: Seconds to wait for a response before auto-denying.
+        timeout: Seconds to wait before auto-denying. ``None`` reads the global
+            ``approvals.timeout`` setting; zero means no deadline.
     """
+    raw_timeout: object = timeout
+    if raw_timeout is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            raw_timeout = (cfg.get("approvals", {}) or {}).get("timeout", 60)
+        except Exception:
+            raw_timeout = 60
+    from hermes_cli.human_wait import normalize_human_timeout
+
+    parsed_timeout = normalize_human_timeout(raw_timeout, default=60)
 
     def _callback(
         command: str,
@@ -149,11 +163,36 @@ def make_approval_callback(
         if future is None:
             return "deny"
 
+        deadline = (
+            None if parsed_timeout == 0 else time.monotonic() + parsed_timeout
+        )
         try:
-            response = future.result(timeout=timeout)
-        except (FutureTimeout, Exception) as exc:
+            from tools.interrupt import is_interrupted
+
+            while True:
+                if is_interrupted():
+                    future.cancel()
+                    return "deny"
+                remaining = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
+                    raise FutureTimeout()
+                poll_timeout = 0.25 if remaining is None else min(0.25, remaining)
+                try:
+                    response = future.result(timeout=poll_timeout)
+                    break
+                except FutureTimeout:
+                    if future.done():
+                        raise
+                    continue
+        except FutureTimeout as exc:
             future.cancel()
-            logger.warning("Permission request timed out or failed: %s", exc)
+            logger.warning("Permission request timed out: %s", exc)
+            return "deny"
+        except Exception as exc:
+            future.cancel()
+            logger.warning("Permission request failed: %s", exc)
             return "deny"
 
         if response is None:
